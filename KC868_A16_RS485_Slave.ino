@@ -20,8 +20,8 @@ HardwareSerial RS485(2);   // Usar Serial2 para RS485
 bool relayStates[16] = {false}; // Estado de todos los relés
 unsigned long relayTimers[16] = {0}; // Timers para auto-apagado (5 segundos)
 
-// Buffer para comandos RS485
-byte commandBuffer[10];
+// Buffer para comandos RS485 (aumentado para comando con delay)
+byte commandBuffer[15];  // Aumentado para protocolo extendido
 int bufferIndex = 0;
 
 void setup() {
@@ -146,6 +146,73 @@ void setRelay(int relayNumber, bool state) {
     Serial.println(state ? "ON (5s auto-off)" : "OFF");
 }
 
+void setRelayWithDelay(int relayNumber, bool state, unsigned long delayMs) {
+    if (relayNumber < 1 || relayNumber > 16) {
+        Serial.println("Error: Relé debe ser 1-16");
+        return;
+    }
+    
+    byte address;
+    int pin;
+    
+    if (relayNumber <= 8) {
+        address = RELAY_CHIP_1;
+        pin = relayNumber - 1;  // 0-7
+    } else {
+        address = RELAY_CHIP_2;
+        pin = relayNumber - 9;  // 0-7
+    }
+    
+    // Leer estado actual del chip
+    byte currentState = readFromChip(address);
+    
+    // Modificar solo el bit correspondiente
+    if (state) {
+        currentState &= ~(1 << pin);  // Clear bit (LOW = ON)
+        
+        // Configurar timer según delay recibido
+        if (delayMs > 0) {
+            relayTimers[relayNumber - 1] = millis() + delayMs;
+            Serial.print("⏰ Relé ");
+            Serial.print(relayNumber);
+            Serial.print(" se apagará automáticamente en ");
+            Serial.print(delayMs);
+            Serial.println(" ms");
+        } else {
+            // Delay 0 = permanente
+            relayTimers[relayNumber - 1] = 0;
+            Serial.print("🔒 Relé ");
+            Serial.print(relayNumber);
+            Serial.println(" encendido permanentemente");
+        }
+    } else {
+        currentState |= (1 << pin);   // Set bit (HIGH = OFF)
+        // Cancelar timer si se apaga manualmente
+        relayTimers[relayNumber - 1] = 0;
+    }
+    
+    // Escribir nuevo estado
+    writeToChip(address, currentState);
+    
+    // Actualizar estado en memoria
+    relayStates[relayNumber - 1] = state;
+    
+    Serial.print("💡 Relé ");
+    Serial.print(relayNumber);
+    Serial.print(": ");
+    if (state) {
+        if (delayMs > 0) {
+            Serial.print("ON (");
+            Serial.print(delayMs);
+            Serial.println("ms auto-off)");
+        } else {
+            Serial.println("ON (permanente)");
+        }
+    } else {
+        Serial.println("OFF");
+    }
+}
+
 byte readFromChip(byte address) {
     Wire.requestFrom(address, (uint8_t)1);
     if (Wire.available()) {
@@ -205,8 +272,8 @@ void processRS485Command() {
         else if (bufferIndex > 0) {
             commandBuffer[bufferIndex++] = b;
             
-            // Comando completo detectado
-            if (b == 0x55 || bufferIndex >= 10) {
+            // Comando completo detectado (ahora 11 bytes para protocolo extendido)
+            if (b == 0x55 || bufferIndex >= 15) {
                 processCommand();
                 bufferIndex = 0;
                 break;
@@ -216,45 +283,121 @@ void processRS485Command() {
 }
 
 void processCommand() {
-    // Verificar estructura mínima
-    if (bufferIndex < 5) {
-        Serial.println("❌ Comando RS485 muy corto");
+    // Compatibilidad: Soporte para protocolo antiguo (7 bytes) y nuevo (11 bytes)
+    Serial.print("🔍 DEBUG: Comando recibido - ");
+    Serial.print(bufferIndex);
+    Serial.print(" bytes: ");
+    for (int i = 0; i < bufferIndex && i < 15; i++) {
+        Serial.print("0x");
+        if (commandBuffer[i] < 16) Serial.print("0");
+        Serial.print(commandBuffer[i], HEX);
+        Serial.print(" ");
+    }
+    Serial.println();
+    
+    if (bufferIndex < 7) {
+        Serial.print("❌ Comando RS485 muy corto: ");
+        Serial.print(bufferIndex);
+        Serial.println(" bytes (mínimo: 7)");
         return;
     }
     
     // Verificar que es para este esclavo
     byte targetSlave = commandBuffer[1];
     if (targetSlave != SLAVE_ID) {
+        Serial.print("🚫 Comando no es para este esclavo (ID: ");
+        Serial.print(targetSlave);
+        Serial.print(", esperado: ");
+        Serial.print(SLAVE_ID);
+        Serial.println(")");
         return; // No es para nosotros, ignorar silenciosamente
     }
     
     byte command = commandBuffer[2];
     
-    // Comando SET_RELAY
-    if (command == 0x01 && bufferIndex >= 7) {
-        // Verificar checksum
-        byte checksum = 0;
-        for (int i = 0; i < 5; i++) {
-            checksum ^= commandBuffer[i];
-        }
-        
-        if (checksum != commandBuffer[5]) {
-            Serial.println("❌ Checksum RS485 inválido");
-            return;
-        }
-        
+    // Comando SET_RELAY (soporte para ambos protocolos)
+    if (command == 0x01) {
         byte relay = commandBuffer[3];
         byte state = commandBuffer[4];
+        unsigned long delayMs = 0;  // Default: sin delay (compatibilidad)
         
-        Serial.print("📡 RS485 ← Master: Relé ");
+        // Protocolo NUEVO (11 bytes) - incluye delay
+        if (bufferIndex >= 11) {
+            Serial.println("🔄 Detectado protocolo NUEVO (11+ bytes)");
+            
+            // Verificar checksum para protocolo nuevo (9 bytes)
+            byte checksum = 0;
+            for (int i = 0; i < 9; i++) {
+                checksum ^= commandBuffer[i];
+            }
+            
+            Serial.print("🔐 Checksum calculado: 0x");
+            Serial.print(checksum, HEX);
+            Serial.print(", recibido: 0x");
+            Serial.println(commandBuffer[9], HEX);
+            
+            if (checksum != commandBuffer[9]) {
+                Serial.println("❌ Checksum RS485 inválido (protocolo nuevo)");
+                return;
+            }
+            
+            // Reconstruir delay de 32 bits desde 4 bytes
+            delayMs |= ((unsigned long)commandBuffer[5] << 24);
+            delayMs |= ((unsigned long)commandBuffer[6] << 16);
+            delayMs |= ((unsigned long)commandBuffer[7] << 8);
+            delayMs |= ((unsigned long)commandBuffer[8]);
+            
+            Serial.print("📡 RS485 ← Master (NUEVO): Relé ");
+            Serial.print(relay);
+            Serial.print(" → ");
+            Serial.print(state ? "ON" : "OFF");
+            Serial.print(" (Delay: ");
+            Serial.print(delayMs);
+            Serial.println("ms)");
+            
+        } 
+        // Protocolo ANTIGUO (7 bytes) - sin delay
+        else if (bufferIndex >= 7) {
+            Serial.println("🔄 Detectado protocolo ANTIGUO (7-10 bytes)");
+            
+            // Verificar checksum para protocolo antiguo (5 bytes)
+            byte checksum = 0;
+            for (int i = 0; i < 5; i++) {
+                checksum ^= commandBuffer[i];
+            }
+            
+            Serial.print("🔐 Checksum calculado: 0x");
+            Serial.print(checksum, HEX);
+            Serial.print(", recibido: 0x");
+            Serial.println(commandBuffer[5], HEX);
+            
+            if (checksum != commandBuffer[5]) {
+                Serial.println("❌ Checksum RS485 inválido (protocolo antiguo)");
+                return;
+            }
+            
+            delayMs = 5000;  // Default: 5 segundos (comportamiento original)
+            
+            Serial.print("📡 RS485 ← Master (ANTIGUO): Relé ");
+            Serial.print(relay);
+            Serial.print(" → ");
+            Serial.print(state ? "ON" : "OFF");
+            Serial.println(" (5s auto-off)");
+        }
+        
+        Serial.print("⚙️  Ejecutando setRelayWithDelay(");
         Serial.print(relay);
-        Serial.print(" → ");
-        Serial.println(state ? "ON" : "OFF");
+        Serial.print(", ");
+        Serial.print(state);
+        Serial.print(", ");
+        Serial.print(delayMs);
+        Serial.println(")");
         
         if (relay >= 1 && relay <= 16 && (state == 0 || state == 1)) {
-            setRelay(relay, state == 1);
+            setRelayWithDelay(relay, state == 1, delayMs);
             sendRS485Response(0x01, 1); // ACK
         } else {
+            Serial.println("❌ Parámetros inválidos");
             sendRS485Response(0x01, 0); // NACK
         }
     }

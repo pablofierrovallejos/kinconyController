@@ -282,32 +282,48 @@ void initRS485() {
     Serial.println("✅ GPIO17 LIBRE PARA ETHERNET CLOCK");
 }
 
-void sendRS485Command(byte slaveId, byte relay, byte state) {
-    // Protocolo: [START][SLAVE_ID][COMMAND][RELAY][STATE][CHECKSUM][END]
-    // START: 0xAA, END: 0x55, COMMAND: 0x01 (SET_RELAY)
+void sendRS485Command(byte slaveId, byte relay, byte state, unsigned long delayMs = 0) {
+    // Protocolo extendido: [START][SLAVE_ID][COMMAND][RELAY][STATE][DELAY_4_BYTES][CHECKSUM][END]
+    // START: 0xAA, END: 0x55, COMMAND: 0x01 (SET_RELAY_WITH_DELAY)
     
     byte command[] = {
-        0xAA,        // START byte
-        slaveId,     // ID del esclavo (1-247)
-        0x01,        // Comando SET_RELAY
-        relay,       // Número de relé (1-16)
-        state,       // Estado (0=OFF, 1=ON)
-        0x00,        // Checksum (se calculará)
-        0x55         // END byte
+        0xAA,                    // START byte
+        slaveId,                 // ID del esclavo (1-247)
+        0x01,                    // Comando SET_RELAY_WITH_DELAY
+        relay,                   // Número de relé (1-16)
+        state,                   // Estado (0=OFF, 1=ON)
+        (byte)(delayMs >> 24),   // Delay byte más significativo
+        (byte)(delayMs >> 16),   // Delay byte 2
+        (byte)(delayMs >> 8),    // Delay byte 3
+        (byte)(delayMs & 0xFF),  // Delay byte menos significativo
+        0x00,                    // Checksum (se calculará)
+        0x55                     // END byte
     };
     
     // Calcular checksum (XOR de todos los bytes excepto checksum y END)
     byte checksum = 0;
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 9; i++) {
         checksum ^= command[i];
     }
-    command[5] = checksum;
+    command[9] = checksum;
+    
+    // 🔍 DEBUG: Mostrar comando que se va a enviar
+    Serial.print("🔍 DEBUG Master → Esclavo ");
+    Serial.print(slaveId);
+    Serial.print(": ");
+    for (int i = 0; i < 11; i++) {
+        Serial.print("0x");
+        if (command[i] < 16) Serial.print("0");
+        Serial.print(command[i], HEX);
+        Serial.print(" ");
+    }
+    Serial.println();
     
     // Enviar comando
     digitalWrite(RS485_DE_PIN, HIGH);  // Modo transmisión
     delay(1);  // Pequeña pausa para estabilizar
     
-    RS485.write(command, 7);
+    RS485.write(command, 11);  // Ahora son 11 bytes en total
     RS485.flush();  // Esperar que termine la transmisión
     
     delay(2);  // Pausa entre transmisión y recepción
@@ -318,7 +334,10 @@ void sendRS485Command(byte slaveId, byte relay, byte state) {
     Serial.print(", Relé ");
     Serial.print(relay);
     Serial.print(": ");
-    Serial.println(state ? "ON" : "OFF");
+    Serial.print(state ? "ON" : "OFF");
+    Serial.print(" (Delay: ");
+    Serial.print(delayMs);
+    Serial.println("ms)");
 }
 
 String sendRS485StatusRequest(byte slaveId) {
@@ -604,11 +623,8 @@ void initHTTPServer() {
                     Serial.print("): ");
                     Serial.println(state ? "ON" : "OFF");
                     
-                    // Enviar comando RS485
-                    sendRS485Command(slaveId, slaveRelay, state);
-                    
-                    // TODO: Implementar delay en esclavo (requiere protocolo extendido)
-                    String delayNote = (delayMs > 0) ? " (delay no implementado en esclavo)" : "";
+                    // Enviar comando RS485 con delay
+                    sendRS485Command(slaveId, slaveRelay, state, delayMs);
                     
                     String response = "{\"status\":\"success\",\"target\":\"slave\",\"slave_id\":" + String(slaveId) + 
                                      ",\"relay\":" + String(relay) + 
@@ -616,7 +632,7 @@ void initHTTPServer() {
                                      ",\"state\":" + String(state) + 
                                      ",\"delay\":" + String(delayMs) + 
                                      ",\"message\":\"Esclavo Relé " + String(slaveRelay) + " " + 
-                                     (state ? "ON" : "OFF") + delayNote + "\"}";
+                                     (state ? "ON" : "OFF") + " (delay: " + String(delayMs) + "ms)\"}";
                     
                     httpServer.send(200, "application/json", response);
                 }
