@@ -1,0 +1,1315 @@
+#include <Wire.h>
+#include <ETH.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HardwareSerial.h>
+
+// Configuración RS485 (PINOUT OFICIAL KC868-A16)
+#define RS485_TX_PIN 13    // Pin TX para RS485 (OFICIAL: TXD=13)
+#define RS485_RX_PIN 16    // Pin RX para RS485 (OFICIAL: RXD=16)  
+#define RS485_DE_PIN 32    // Pin DE (Data Enable) para RS485 (Pin libre)
+#define RS485_BAUD 9600    // Velocidad RS485
+
+HardwareSerial RS485(2);   // Usar Serial2 para RS485
+
+// Configuración específica KC868-A16 basada en documentación oficial
+#define ETH_CLK_MODE    ETH_CLOCK_GPIO17_OUT
+#define ETH_PHY_POWER   12
+#define ETH_PHY_MDC     23
+#define ETH_PHY_MDIO    18
+#define ETH_PHY_TYPE    ETH_PHY_LAN8720
+#define ETH_PHY_ADDR    0
+
+// Direcciones I2C para relés
+#define RELAY_CHIP_1 0x24  // Relés 1-8
+#define RELAY_CHIP_2 0x25  // Relés 9-16
+
+// Configuración de red
+IPAddress local_IP(192, 168, 2, 100);     // IP fija para la KC868-A16
+IPAddress gateway(192, 168, 2, 1);        // Gateway de tu red
+IPAddress subnet(255, 255, 255, 0);       // Máscara de subred
+
+// Servidores
+WiFiServer tcpServer(8080);  // Servidor TCP en puerto 8080
+WebServer httpServer(80);    // Servidor HTTP en puerto 80
+WiFiClient tcpClient;
+
+// Variables de estado
+bool relayStates[16] = {false}; // Estado de todos los relés
+unsigned long relayTimers[16] = {0}; // Timers para auto-apagado (5 segundos)
+
+void setup() {
+    Serial.begin(115200);
+    delay(2000);  // Esperar estabilización
+    Serial.println("=== KC868-A16 ETHERNET OPTIMIZADO ===");
+    
+    // Mostrar información del chip
+    Serial.print("Chip: ");
+    Serial.println(ESP.getChipModel());
+    Serial.print("Revisión: ");
+    Serial.println(ESP.getChipRevision());
+    Serial.print("Frecuencia CPU: ");
+    Serial.print(ESP.getCpuFreqMHz());
+    Serial.println(" MHz");
+    Serial.print("Memoria libre: ");
+    Serial.print(ESP.getFreeHeap() / 1024);
+    Serial.println(" KB");
+    
+    // PRIORIDAD MÁXIMA A ETHERNET
+    Serial.println("\n🚀 INICIALIZANDO ETHERNET CON PRIORIDAD MÁXIMA");
+    
+    // Liberar WiFi completamente para Ethernet
+    WiFi.mode(WIFI_OFF);
+    delay(1000);
+    
+    // Inicializar Ethernet PRIMERO
+    initEthernet();
+    
+    // Después inicializar I2C para relés
+    Serial.println("\n🔧 Inicializando control de relés...");
+    Wire.begin(4, 5);
+    delay(100);
+    
+    // Inicializar RS485 Master (PINOUT OFICIAL KC868-A16)
+    initRS485();
+    
+    // Verificar chips I2C
+    bool chip1_ok = testChip(RELAY_CHIP_1);
+    bool chip2_ok = testChip(RELAY_CHIP_2);
+    
+    if (chip1_ok && chip2_ok) {
+        Serial.println("✅ Chips I2C OK - Relés listos");
+        turnOffAllRelays();
+    } else {
+        Serial.println("⚠️  Problemas con chips I2C:");
+        Serial.print("  Chip 0x24: ");
+        Serial.println(chip1_ok ? "OK" : "ERROR");
+        Serial.print("  Chip 0x25: ");
+        Serial.println(chip2_ok ? "OK" : "ERROR");
+    }
+    
+    // Verificar conectividad final
+    bool hasConnectivity = false;
+    String connectionType = "";
+    IPAddress currentIP;
+    
+    if (ETH.linkUp()) {
+        hasConnectivity = true;
+        connectionType = "Ethernet";
+        currentIP = ETH.localIP();
+        Serial.println("\n🎯 ¡ETHERNET COMO CONEXIÓN PRINCIPAL!");
+    } else if (WiFi.status() == WL_CONNECTED) {
+        hasConnectivity = true;
+        connectionType = "WiFi";
+        currentIP = WiFi.localIP();
+        Serial.println("\n📶 WiFi como respaldo");
+    }
+    
+    if (hasConnectivity) {
+        // Inicializar servidores
+        initTCPServer();
+        initHTTPServer();
+        
+        Serial.println("\n╔══════════════════════════════════════════════╗");
+        Serial.println("║           🎉 SISTEMA LISTO 🎉               ║");
+        Serial.println("╚══════════════════════════════════════════════╝");
+        
+        Serial.print("🌐 Conectado por: ");
+        Serial.print(connectionType);
+        if (connectionType == "Ethernet") {
+            Serial.println(" ⚡ (OBJETIVO CUMPLIDO!)");
+        }
+        
+        Serial.print("📍 IP de control: ");
+        Serial.println(currentIP);
+        
+        Serial.println("\n═══ APIs PARA POSTMAN ═══");
+        Serial.print("🔗 POST http://");
+        Serial.print(currentIP);
+        Serial.println("/relay");
+        Serial.println("   📝 Body: {\"relay\":5,\"state\":1}");
+        
+        Serial.print("🔗 GET  http://");
+        Serial.print(currentIP);
+        Serial.println("/status");
+        
+        Serial.println("\n✅ ¡LISTO PARA CONTROL REMOTO!");
+        
+    } else {
+        Serial.println("\n⚠️  MODO SOLO SERIE");
+        Serial.println("📝 Comandos disponibles:");
+        Serial.println("  • SET,5,1  - Encender relé 5");
+        Serial.println("  • STATUS   - Ver estado");
+    }
+}
+
+bool testChip(byte address) {
+    Wire.beginTransmission(address);
+    return (Wire.endTransmission() == 0);
+}
+
+void turnOffAllRelays() {
+    Serial.println("Apagando todos los relés...");
+    writeToChip(RELAY_CHIP_1, 0xFF);  // Todos HIGH = OFF
+    writeToChip(RELAY_CHIP_2, 0xFF);  // Todos HIGH = OFF
+}
+
+void writeToChip(byte address, byte value) {
+    Wire.beginTransmission(address);
+    Wire.write(value);
+    Wire.endTransmission();
+}
+
+void setRelay(int relayNumber, bool state) {
+    if (relayNumber < 1 || relayNumber > 16) {
+        Serial.println("Error: Relé debe ser 1-16");
+        return;
+    }
+    
+    byte address;
+    int pin;
+    
+    if (relayNumber <= 8) {
+        address = RELAY_CHIP_1;
+        pin = relayNumber - 1;  // 0-7
+    } else {
+        address = RELAY_CHIP_2;
+        pin = relayNumber - 9;  // 0-7
+    }
+    
+    // Leer estado actual del chip
+    byte currentState = readFromChip(address);
+    
+    // Modificar solo el bit correspondiente
+    if (state) {
+        currentState &= ~(1 << pin);  // Clear bit (LOW = ON)
+        // ⏰ NUEVA FUNCIONALIDAD: Auto-apagado en 5 segundos
+        relayTimers[relayNumber - 1] = millis() + 5000; // 5000ms = 5 segundos
+        Serial.print("⏰ Relé ");
+        Serial.print(relayNumber);
+        Serial.println(" se apagará automáticamente en 5 segundos");
+    } else {
+        currentState |= (1 << pin);   // Set bit (HIGH = OFF)
+        // Cancelar timer si se apaga manualmente
+        relayTimers[relayNumber - 1] = 0;
+    }
+    
+    // Escribir nuevo estado
+    writeToChip(address, currentState);
+    
+    // Actualizar estado en memoria
+    relayStates[relayNumber - 1] = state;
+    
+    Serial.print("Relé ");
+    Serial.print(relayNumber);
+    Serial.print(": ");
+    Serial.println(state ? "ON (5s auto-off)" : "OFF");
+}
+
+byte readFromChip(byte address) {
+    Wire.requestFrom(address, (uint8_t)1);
+    if (Wire.available()) {
+        return Wire.read();
+    }
+    return 0xFF;  // Default: todos OFF
+}
+
+void checkAutoOffTimers() {
+    // Verificar timers de auto-apagado (cada 100ms para precisión)
+    static unsigned long lastCheck = 0;
+    if (millis() - lastCheck < 100) return;
+    lastCheck = millis();
+    
+    unsigned long now = millis();
+    
+    for (int i = 0; i < 16; i++) {
+        // Si hay un timer activo y ha expirado
+        if (relayTimers[i] > 0 && now >= relayTimers[i]) {
+            // Apagar el relé automáticamente
+            int relayNumber = i + 1;
+            
+            byte address;
+            int pin;
+            
+            if (relayNumber <= 8) {
+                address = RELAY_CHIP_1;
+                pin = relayNumber - 1;
+            } else {
+                address = RELAY_CHIP_2;
+                pin = relayNumber - 9;
+            }
+            
+            // Leer estado actual y apagar el relé
+            byte currentState = readFromChip(address);
+            currentState |= (1 << pin);   // Set bit (HIGH = OFF)
+            writeToChip(address, currentState);
+            
+            // Actualizar estado
+            relayStates[i] = false;
+            relayTimers[i] = 0;  // Limpiar timer
+            
+            Serial.print("⏰ AUTO-OFF: Relé ");
+            Serial.print(relayNumber);
+            Serial.println(" apagado automáticamente después de 5 segundos");
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//                   FUNCIONES RS485 MASTER (NUEVOS PINES)
+// ═══════════════════════════════════════════════════════════════
+
+void initRS485() {
+    Serial.println("\n🔌 Inicializando RS485 Master (PINOUT OFICIAL KC868-A16)...");
+    
+    // Configurar pin DE (Data Enable)
+    pinMode(RS485_DE_PIN, OUTPUT);
+    digitalWrite(RS485_DE_PIN, LOW);  // Modo recepción por defecto
+    
+    // Inicializar puerto serie RS485
+    RS485.begin(RS485_BAUD, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
+    
+    Serial.println("✅ RS485 Master iniciado - PINOUT OFICIAL KC868-A16");
+    Serial.print("📍 TXD: GPIO");
+    Serial.print(RS485_TX_PIN);
+    Serial.print(" (OFICIAL), RXD: GPIO");
+    Serial.print(RS485_RX_PIN);
+    Serial.print(" (OFICIAL), DE: GPIO");
+    Serial.println(RS485_DE_PIN);
+    Serial.print("⚡ Baud: ");
+    Serial.println(RS485_BAUD);
+    Serial.println("🎯 PINOUT SEGÚN DOCUMENTACIÓN KC868-A16");
+    Serial.println("✅ GPIO17 LIBRE PARA ETHERNET CLOCK");
+}
+
+void sendRS485Command(byte slaveId, byte relay, byte state, unsigned long delayMs = 0) {
+    // Protocolo extendido: [START][SLAVE_ID][COMMAND][RELAY][STATE][DELAY_4_BYTES][CHECKSUM][END]
+    // START: 0xAA, END: 0x55, COMMAND: 0x01 (SET_RELAY_WITH_DELAY)
+    
+    byte command[] = {
+        0xAA,                    // START byte
+        slaveId,                 // ID del esclavo (1-247)
+        0x01,                    // Comando SET_RELAY_WITH_DELAY
+        relay,                   // Número de relé (1-16)
+        state,                   // Estado (0=OFF, 1=ON)
+        (byte)(delayMs >> 24),   // Delay byte más significativo
+        (byte)(delayMs >> 16),   // Delay byte 2
+        (byte)(delayMs >> 8),    // Delay byte 3
+        (byte)(delayMs & 0xFF),  // Delay byte menos significativo
+        0x00,                    // Checksum (se calculará)
+        0x55                     // END byte
+    };
+    
+    // Calcular checksum (XOR de todos los bytes excepto checksum y END)
+    byte checksum = 0;
+    for (int i = 0; i < 9; i++) {
+        checksum ^= command[i];
+    }
+    command[9] = checksum;
+    
+    // 🔍 DEBUG: Mostrar comando que se va a enviar
+    Serial.print("🔍 DEBUG Master → Esclavo ");
+    Serial.print(slaveId);
+    Serial.print(": ");
+    for (int i = 0; i < 11; i++) {
+        Serial.print("0x");
+        if (command[i] < 16) Serial.print("0");
+        Serial.print(command[i], HEX);
+        Serial.print(" ");
+    }
+    Serial.println();
+    
+    // Enviar comando
+    digitalWrite(RS485_DE_PIN, HIGH);  // Modo transmisión
+    delay(1);  // Pequeña pausa para estabilizar
+    
+    RS485.write(command, 11);  // Ahora son 11 bytes en total
+    RS485.flush();  // Esperar que termine la transmisión
+    
+    delay(2);  // Pausa entre transmisión y recepción
+    digitalWrite(RS485_DE_PIN, LOW);   // Modo recepción
+    
+    Serial.print("📡 RS485 → Esclavo ");
+    Serial.print(slaveId);
+    Serial.print(", Relé ");
+    Serial.print(relay);
+    Serial.print(": ");
+    Serial.print(state ? "ON" : "OFF");
+    Serial.print(" (Delay: ");
+    Serial.print(delayMs);
+    Serial.println("ms)");
+}
+
+String sendRS485StatusRequest(byte slaveId) {
+    // Protocolo: [START][SLAVE_ID][COMMAND][CHECKSUM][END]
+    // COMMAND: 0x02 (GET_STATUS)
+    
+    byte command[] = {
+        0xAA,        // START byte
+        slaveId,     // ID del esclavo
+        0x02,        // Comando GET_STATUS
+        0x00,        // Checksum
+        0x55         // END byte
+    };
+    
+    // Calcular checksum
+    byte checksum = 0xAA ^ slaveId ^ 0x02;
+    command[3] = checksum;
+    
+    // Enviar comando
+    digitalWrite(RS485_DE_PIN, HIGH);
+    delay(1);
+    
+    RS485.write(command, 5);
+    RS485.flush();
+    
+    delay(2);
+    digitalWrite(RS485_DE_PIN, LOW);
+    
+    // Esperar respuesta (timeout 1 segundo)
+    unsigned long timeout = millis() + 1000;
+    String response = "";
+    
+    while (millis() < timeout) {
+        if (RS485.available()) {
+            char c = RS485.read();
+            response += c;
+            
+            // Si recibimos byte de fin, terminar
+            if (c == 0x55) break;
+        }
+        delay(1);
+    }
+    
+    Serial.print("📡 RS485 STATUS ← Esclavo ");
+    Serial.print(slaveId);
+    Serial.print(": ");
+    Serial.println(response.length() > 0 ? "Respuesta recibida" : "Sin respuesta");
+    
+    return response;
+}
+
+void initEthernet() {
+    Serial.println("=== ETHERNET KC868-A16 CONFIGURACIÓN OFICIAL ===");
+    
+    // Configuración basada en documentación oficial de Kincony
+    Serial.println("Parámetros oficiales KC868-A16:");
+    Serial.println("• ETH_PHY_POWER: GPIO12");
+    Serial.println("• ETH_PHY_MDC: GPIO23");  
+    Serial.println("• ETH_PHY_MDIO: GPIO18");
+    Serial.println("• ETH_CLK_MODE: GPIO17_OUT");
+    Serial.println("• ETH_PHY_TYPE: LAN8720");
+    Serial.println("• ETH_PHY_ADDR: 0");
+    
+    Serial.print("\n🚀 Inicializando Ethernet... ");
+    
+    // Configuración oficial KC868-A16
+    bool success = ETH.begin(ETH_PHY_TYPE, ETH_PHY_ADDR, ETH_PHY_MDC, ETH_PHY_MDIO, ETH_PHY_POWER, ETH_CLK_MODE);
+    
+    if (success) {
+        Serial.println("✅ ETH.begin() exitoso!");
+        
+        // Esperar enlace físico con timeout extendido
+        Serial.print("⏳ Detectando enlace físico");
+        int timeout = 150; // 15 segundos
+        bool linkDetected = false;
+        
+        while (timeout > 0 && !linkDetected) {
+            delay(100);
+            if (ETH.linkUp()) {
+                linkDetected = true;
+                break;
+            }
+            if (timeout % 15 == 0) Serial.print(".");
+            timeout--;
+        }
+        
+        if (linkDetected) {
+            Serial.println(" ✅ ¡ENLACE DETECTADO!");
+            configureStaticIP();
+            
+            Serial.println("\n🎉 ¡ETHERNET KC868-A16 FUNCIONANDO!");
+            Serial.println("✅ Configuración oficial exitosa");
+            return;
+        } else {
+            Serial.println(" ❌ Sin enlace físico después de 15 segundos");
+        }
+    } else {
+        Serial.println("❌ ETH.begin() falló con configuración oficial");
+    }
+    
+    // Configuraciones alternativas rápidas
+    Serial.println("\n🔄 Probando configuraciones alternativas...");
+    
+    // Alternativa 1: Sin power pin
+    Serial.print("Alt 1 (sin power)... ");
+    ETH.end();
+    delay(1000);
+    
+    if (ETH.begin(ETH_PHY_LAN8720, 0, 23, 18, -1, ETH_CLOCK_GPIO17_OUT)) {
+        Serial.println("✅ OK");
+        delay(5000);
+        if (ETH.linkUp()) {
+            Serial.println("✅ ¡ENLACE ALTERNATIVO DETECTADO!");
+            configureStaticIP();
+            return;
+        }
+        Serial.println("❌ Sin enlace");
+    } else {
+        Serial.println("❌ Falló");
+    }
+    
+    // Alternativa 2: Clock GPIO0
+    Serial.print("Alt 2 (clock GPIO0)... ");
+    ETH.end();
+    delay(1000);
+    
+    if (ETH.begin(ETH_PHY_LAN8720, 0, 23, 18, 12, ETH_CLOCK_GPIO0_IN)) {
+        Serial.println("✅ OK");
+        delay(5000);
+        if (ETH.linkUp()) {
+            Serial.println("✅ ¡ENLACE ALTERNATIVO DETECTADO!");
+            configureStaticIP();
+            return;
+        }
+        Serial.println("❌ Sin enlace");
+    } else {
+        Serial.println("❌ Falló");
+    }
+    
+    // Alternativa 3: PHY addr 1
+    Serial.print("Alt 3 (PHY addr 1)... ");
+    ETH.end();
+    delay(1000);
+    
+    if (ETH.begin(ETH_PHY_LAN8720, 1, 23, 18, -1, ETH_CLOCK_GPIO17_OUT)) {
+        Serial.println("✅ OK");
+        delay(5000);
+        if (ETH.linkUp()) {
+            Serial.println("✅ ¡ENLACE ALTERNATIVO DETECTADO!");
+            configureStaticIP();
+            return;
+        }
+        Serial.println("❌ Sin enlace");
+    } else {
+        Serial.println("❌ Falló");
+    }
+    
+    // Si todo falla, diagnóstico y WiFi
+    Serial.println("\n❌ ETHERNET NO DISPONIBLE");
+    Serial.println("🔍 Verificaciones necesarias:");
+    Serial.println("  1. ¿Cable Ethernet conectado y funcionando?");
+    Serial.println("  2. ¿Alimentación 12V DC conectada?");
+    Serial.println("  3. ¿Switch/router con luces de actividad?");
+    Serial.println("  4. ¿LEDs del puerto Ethernet encendidos?");
+    
+    Serial.println("\n🔄 Activando WiFi como respaldo...");
+    delay(2000);
+    initWiFi();
+}
+
+void initWiFi() {
+    Serial.println("\n=== WIFI COMO RESPALDO ===");
+    
+    WiFi.mode(WIFI_STA);
+    
+    // Credenciales WiFi - CAMBIAR ESTAS
+    const char* ssid = "MERCUSYS_57B0";
+    const char* password = "96552333Aa";
+    
+    Serial.print("Conectando a WiFi: ");
+    Serial.println(ssid);
+    
+    WiFi.begin(ssid, password);
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        delay(1000);
+        Serial.print(".");
+        attempts++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\n✅ WiFi conectado!");
+        
+        Serial.println("\n=== WIFI CONECTADO ===");
+        Serial.print("IP: ");
+        Serial.println(WiFi.localIP());
+        Serial.print("RSSI: ");
+        Serial.print(WiFi.RSSI());
+        Serial.println(" dBm");
+    } else {
+        Serial.println("\n❌ Falló conexión WiFi");
+        Serial.println("💡 Modificar credenciales en el código");
+    }
+}
+
+void configureStaticIP() {
+    Serial.println("Configurando IP estática...");
+    if (!ETH.config(local_IP, gateway, subnet)) {
+        Serial.println("Error configurando IP estática");
+    }
+    
+    delay(2000);  // Tiempo para configuración
+    
+    Serial.println("\n=== ETHERNET CONECTADO ===");
+    Serial.print("IP: ");
+    Serial.println(ETH.localIP());
+    Serial.print("Gateway: ");
+    Serial.println(ETH.gatewayIP());
+    Serial.print("MAC: ");
+    Serial.println(ETH.macAddress());
+    Serial.print("Velocidad: ");
+    Serial.print(ETH.linkSpeed());
+    Serial.println(" Mbps");
+    Serial.print("Full Duplex: ");
+    Serial.println(ETH.fullDuplex() ? "SI" : "NO");
+}
+
+void initTCPServer() {
+    tcpServer.begin();
+    Serial.println("Servidor TCP iniciado en puerto 8080");
+}
+
+void initHTTPServer() {
+    // Configurar CORS
+    httpServer.enableCORS(true);
+    
+    // POST /activate - ENDPOINT UNIFICADO Master + Esclavo
+    httpServer.on("/activate", HTTP_POST, []() {
+        String body = httpServer.arg("plain");
+        Serial.println("POST /activate recibido: " + body);
+        
+        int relay = 0, state = 0, delayMs = 0;
+        if (parseActivateJSON(body, relay, state, delayMs)) {
+            if (relay >= 1 && relay <= 32 && (state == 0 || state == 1)) {
+                
+                // LÓGICA CORREGIDA: 1-16 Master, 17-32 Esclavo
+                if (relay >= 1 && relay <= 16) {
+                    // ===== CONTROL MASTER LOCAL (Relés 1-16) =====
+                    Serial.print("🎯 MASTER LOCAL - Relé ");
+                    Serial.print(relay);
+                    Serial.print(": ");
+                    Serial.println(state ? "ON" : "OFF");
+                    
+                    if (state == 1 && delayMs > 0) {
+                        // Activar con delay personalizado
+                        setRelayWithDelay(relay, true, delayMs);
+                    } else if (state == 1 && delayMs == 0) {
+                        // Activar permanente (sin auto-apagado)
+                        setRelayPermanent(relay, true);
+                    } else {
+                        // Apagar
+                        setRelayPermanent(relay, false);
+                    }
+                    
+                    String response = "{\"status\":\"success\",\"target\":\"master\",\"relay\":" + String(relay) + 
+                                     ",\"state\":" + String(state) + 
+                                     ",\"delay\":" + String(delayMs) + 
+                                     ",\"message\":\"Master Relé " + String(relay) + " " + 
+                                     (state ? (delayMs == 0 ? "ON permanente" : "ON " + String(delayMs) + "ms") : "OFF") + "\"}";
+                    
+                    httpServer.send(200, "application/json", response);
+                    
+                } else if (relay >= 17 && relay <= 32) {
+                    // ===== CONTROL ESCLAVO RS485 (Relés 17-32) =====
+                    int slaveRelay = relay - 16; // Convertir: 17→1, 18→2, ..., 32→16
+                    int slaveId = 1; // ID fijo del esclavo
+                    
+                    Serial.print("📡 ESCLAVO RS485 - Relé ");
+                    Serial.print(slaveRelay);
+                    Serial.print(" (relay ");
+                    Serial.print(relay);
+                    Serial.print("): ");
+                    Serial.println(state ? "ON" : "OFF");
+                    
+                    // Enviar comando RS485 con delay
+                    sendRS485Command(slaveId, slaveRelay, state, delayMs);
+                    
+                    String response = "{\"status\":\"success\",\"target\":\"slave\",\"slave_id\":" + String(slaveId) + 
+                                     ",\"relay\":" + String(relay) + 
+                                     ",\"slave_relay\":" + String(slaveRelay) + 
+                                     ",\"state\":" + String(state) + 
+                                     ",\"delay\":" + String(delayMs) + 
+                                     ",\"message\":\"Esclavo Relé " + String(slaveRelay) + " " + 
+                                     (state ? "ON" : "OFF") + " (delay: " + String(delayMs) + "ms)\"}";
+                    
+                    httpServer.send(200, "application/json", response);
+                }
+                
+            } else {
+                httpServer.send(400, "application/json", 
+                               "{\"status\":\"error\",\"message\":\"relay 1-32, state 0-1\"}");
+            }
+        } else {
+            httpServer.send(400, "application/json", 
+                           "{\"status\":\"error\",\"message\":\"JSON inválido. Usar: {\\\"relay\\\":8,\\\"state\\\":1,\\\"delay\\\":8000}\"}");
+        }
+    });
+    
+    // POST /relay - Controlar relé (MANTENIDO PARA COMPATIBILIDAD)
+    httpServer.on("/relay", HTTP_POST, []() {
+        String body = httpServer.arg("plain");
+        Serial.println("POST recibido: " + body);
+        
+        int relay = 0, state = 0;
+        if (parseJSON(body, relay, state)) {
+            if (relay >= 1 && relay <= 16 && (state == 0 || state == 1)) {
+                setRelay(relay, state == 1);
+                
+                String response = "{\"status\":\"success\",\"relay\":" + String(relay) + 
+                                 ",\"state\":" + String(state) + 
+                                 ",\"message\":\"Relé " + String(relay) + " " + 
+                                 (state ? "ON" : "OFF") + "\"}";
+                
+                httpServer.send(200, "application/json", response);
+            } else {
+                httpServer.send(400, "application/json", 
+                               "{\"status\":\"error\",\"message\":\"Relay 1-16, state 0-1\"}");
+            }
+        } else {
+            httpServer.send(400, "application/json", 
+                           "{\"status\":\"error\",\"message\":\"JSON inválido\"}");
+        }
+    });
+    
+    // GET /status - Ver estado de todos los relés
+    httpServer.on("/status", HTTP_GET, []() {
+        String response = "{\"relays\":[";
+        for (int i = 0; i < 16; i++) {
+            if (i > 0) response += ",";
+            response += "{\"relay\":" + String(i + 1) + 
+                       ",\"state\":" + String(relayStates[i] ? 1 : 0) + 
+                       ",\"status\":\"" + String(relayStates[i] ? "ON" : "OFF") + "\"}";
+        }
+        response += "]}";
+        httpServer.send(200, "application/json", response);
+    });
+    
+    // GET / - Página de ayuda
+    httpServer.on("/", HTTP_GET, []() {
+        String html = "<html><body>";
+        html += "<h1>KC868-A16 Relay Controller</h1>";
+        html += "<h2>API Endpoints:</h2>";
+        html += "<p><b>POST /relay</b> - Control relay<br>";
+        html += "Body: {\"relay\":5,\"state\":1}</p>";
+        html += "<p><b>GET /status</b> - All relays status</p>";
+        html += "</body></html>";
+        httpServer.send(200, "text/html", html);
+    });
+    
+    httpServer.begin();
+    Serial.println("Servidor HTTP iniciado en puerto 80");
+}
+
+bool parseJSON(String json, int &relay, int &state) {
+    json.trim();
+    
+    int relayPos = json.indexOf("\"relay\":");
+    int statePos = json.indexOf("\"state\":");
+    
+    if (relayPos == -1 || statePos == -1) return false;
+    
+    // Extraer valor de relay
+    int relayStart = json.indexOf(":", relayPos) + 1;
+    int relayEnd = json.indexOf(",", relayStart);
+    if (relayEnd == -1) relayEnd = json.indexOf("}", relayStart);
+    
+    relay = json.substring(relayStart, relayEnd).toInt();
+    
+    // Extraer valor de state
+    int stateStart = json.indexOf(":", statePos) + 1;
+    int stateEnd = json.indexOf("}", stateStart);
+    if (stateEnd == -1) stateEnd = json.indexOf(",", stateStart);
+    
+    state = json.substring(stateStart, stateEnd).toInt();
+    
+    return true;
+}
+
+bool parseActivateJSON(String json, int &relay, int &state, int &delayMs) {
+    json.trim();
+    
+    int relayPos = json.indexOf("\"relay\":");
+    int statePos = json.indexOf("\"state\":");
+    int delayPos = json.indexOf("\"delay\":");
+    
+    if (relayPos == -1 || statePos == -1) return false;
+    
+    // Extraer relay
+    int relayStart = json.indexOf(":", relayPos) + 1;
+    int relayEnd = json.indexOf(",", relayStart);
+    if (relayEnd == -1) relayEnd = json.indexOf("}", relayStart);
+    relay = json.substring(relayStart, relayEnd).toInt();
+    
+    // Extraer state
+    int stateStart = json.indexOf(":", statePos) + 1;
+    int stateEnd = json.indexOf(",", stateStart);
+    if (stateEnd == -1) stateEnd = json.indexOf("}", stateStart);
+    state = json.substring(stateStart, stateEnd).toInt();
+    
+    // Extraer delay (en microsegundos, convertir a milisegundos)
+    if (delayPos != -1) {
+        int delayStart = json.indexOf(":", delayPos) + 1;
+        int delayEnd = json.indexOf("}", delayStart);
+        if (delayEnd == -1) delayEnd = json.indexOf(",", delayStart);
+        int delayMicros = json.substring(delayStart, delayEnd).toInt();
+        delayMs = delayMicros; // Convertir microsegundos a milisegundos: /1000, pero el usuario quiere microsegundos como milisegundos
+        Serial.print("🕐 Delay recibido: ");
+        Serial.print(delayMicros);
+        Serial.print(" microsegundos → ");
+        Serial.print(delayMs);
+        Serial.println(" ms (aplicado)");
+    } else {
+        delayMs = 5000; // Default: 5 segundos si no se especifica
+    }
+    
+    return true;
+}
+
+void setRelayWithDelay(int relayNumber, bool state, int delayMs) {
+    if (relayNumber < 1 || relayNumber > 16) {
+        Serial.println("Error: Relé debe ser 1-16");
+        return;
+    }
+    
+    byte address;
+    int pin;
+    
+    if (relayNumber <= 8) {
+        address = RELAY_CHIP_1;
+        pin = relayNumber - 1;  // 0-7
+    } else {
+        address = RELAY_CHIP_2;
+        pin = relayNumber - 9;  // 0-7
+    }
+    
+    // Leer estado actual del chip
+    byte currentState = readFromChip(address);
+    
+    // Modificar solo el bit correspondiente
+    if (state) {
+        currentState &= ~(1 << pin);  // Clear bit (LOW = ON)
+        // Configurar timer personalizado
+        relayTimers[relayNumber - 1] = millis() + delayMs;
+        Serial.print("⏰ Relé ");
+        Serial.print(relayNumber);
+        Serial.print(" se apagará automáticamente en ");
+        Serial.print(delayMs);
+        Serial.println(" ms");
+    } else {
+        currentState |= (1 << pin);   // Set bit (HIGH = OFF)
+        // Cancelar timer si se apaga manualmente
+        relayTimers[relayNumber - 1] = 0;
+    }
+    
+    // Escribir nuevo estado
+    writeToChip(address, currentState);
+    
+    // Actualizar estado en memoria
+    relayStates[relayNumber - 1] = state;
+    
+    Serial.print("💡 Relé ");
+    Serial.print(relayNumber);
+    Serial.print(": ");
+    Serial.print(state ? "ON" : "OFF");
+    if (state && delayMs > 0) {
+        Serial.print(" (auto-off ");
+        Serial.print(delayMs);
+        Serial.print("ms)");
+    }
+    Serial.println();
+}
+
+void setRelayPermanent(int relayNumber, bool state) {
+    if (relayNumber < 1 || relayNumber > 16) {
+        Serial.println("Error: Relé debe ser 1-16");
+        return;
+    }
+    
+    byte address;
+    int pin;
+    
+    if (relayNumber <= 8) {
+        address = RELAY_CHIP_1;
+        pin = relayNumber - 1;  // 0-7
+    } else {
+        address = RELAY_CHIP_2;
+        pin = relayNumber - 9;  // 0-7
+    }
+    
+    // Leer estado actual del chip
+    byte currentState = readFromChip(address);
+    
+    // Modificar solo el bit correspondiente
+    if (state) {
+        currentState &= ~(1 << pin);  // Clear bit (LOW = ON)
+        // NO configurar timer (permanente)
+        relayTimers[relayNumber - 1] = 0;
+        Serial.print("🔒 Relé ");
+        Serial.print(relayNumber);
+        Serial.println(" encendido PERMANENTE (sin auto-apagado)");
+    } else {
+        currentState |= (1 << pin);   // Set bit (HIGH = OFF)
+        // Cancelar timer si se apaga manualmente
+        relayTimers[relayNumber - 1] = 0;
+    }
+    
+    // Escribir nuevo estado
+    writeToChip(address, currentState);
+    
+    // Actualizar estado en memoria
+    relayStates[relayNumber - 1] = state;
+    
+    Serial.print("💡 Relé ");
+    Serial.print(relayNumber);
+    Serial.print(": ");
+    Serial.println(state ? "ON (PERMANENTE)" : "OFF");
+}
+
+bool parseRS485JSON(String json, int &slaveId, int &relay, int &state) {
+    json.trim();
+    
+    int slavePos = json.indexOf("\"slave\":");
+    int relayPos = json.indexOf("\"relay\":");
+    int statePos = json.indexOf("\"state\":");
+    
+    if (slavePos == -1 || relayPos == -1 || statePos == -1) return false;
+    
+    // Extraer slaveId
+    int slaveStart = json.indexOf(":", slavePos) + 1;
+    int slaveEnd = json.indexOf(",", slaveStart);
+    slaveId = json.substring(slaveStart, slaveEnd).toInt();
+    
+    // Extraer relay
+    int relayStart = json.indexOf(":", relayPos) + 1;
+    int relayEnd = json.indexOf(",", relayStart);
+    if (relayEnd == -1) relayEnd = json.indexOf("}", relayStart);
+    relay = json.substring(relayStart, relayEnd).toInt();
+    
+    // Extraer state
+    int stateStart = json.indexOf(":", statePos) + 1;
+    int stateEnd = json.indexOf("}", stateStart);
+    if (stateEnd == -1) stateEnd = json.indexOf(",", stateStart);
+    state = json.substring(stateStart, stateEnd).toInt();
+    
+    return true;
+}
+
+void processCommand(String command, WiFiClient* client = nullptr) {
+    String response = "";
+    
+    if (command.startsWith("SET,")) {
+        int firstComma = command.indexOf(',');
+        int secondComma = command.indexOf(',', firstComma + 1);
+        
+        if (firstComma > 0 && secondComma > 0) {
+            int relay = command.substring(firstComma + 1, secondComma).toInt();
+            int state = command.substring(secondComma + 1).toInt();
+            
+            if (relay >= 1 && relay <= 16 && (state == 0 || state == 1)) {
+                setRelay(relay, state == 1);
+                response = "OK: Relé " + String(relay) + " " + (state ? "ON" : "OFF") + "\r\n";
+            } else {
+                response = "ERROR: Parámetros inválidos\r\n";
+            }
+        } else {
+            response = "ERROR: Formato incorrecto\r\n";
+        }
+    }
+    else if (command == "STATUS") {
+        response = "Estado de relés:\r\n";
+        for (int i = 0; i < 16; i++) {
+            response += "Relé " + String(i + 1) + ": " + (relayStates[i] ? "ON" : "OFF") + "\r\n";
+        }
+    }
+    else {
+        response = "ERROR: Comando desconocido\r\n";
+    }
+    
+    if (client && response.length() > 0) {
+        client->print(response);
+    } else if (!client) {
+        Serial.print(response);
+    }
+}
+
+void loop() {
+    // ⏰ VERIFICAR TIMERS DE AUTO-APAGADO (NUEVA FUNCIONALIDAD)
+    checkAutoOffTimers();
+    
+    // Manejar servidor HTTP
+    httpServer.handleClient();
+    
+    // Manejar conexiones TCP
+    WiFiClient newClient = tcpServer.available();
+    
+    if (newClient) {
+        Serial.print("Nueva conexión TCP desde: ");
+        Serial.println(newClient.remoteIP());
+        tcpClient = newClient;
+    }
+    
+    // Procesar comandos TCP
+    if (tcpClient && tcpClient.connected()) {
+        if (tcpClient.available()) {
+            String command = tcpClient.readStringUntil('\n');
+            command.trim();
+            command.toUpperCase();
+            
+            Serial.print("Comando TCP: ");
+            Serial.println(command);
+            
+            processCommand(command, &tcpClient);
+        }
+    } else if (tcpClient) {
+        tcpClient.stop();
+    }
+    
+    // Status cada 30 segundos
+    static unsigned long lastPrint = 0;
+    if (millis() - lastPrint > 30000) {
+        if (ETH.linkUp()) {
+            Serial.print("Sistema activo - Ethernet IP: ");
+            Serial.println(ETH.localIP());
+        } else if (WiFi.status() == WL_CONNECTED) {
+            Serial.print("Sistema activo - WiFi IP: ");
+            Serial.println(WiFi.localIP());
+        }
+        lastPrint = millis();
+    }
+    
+    // Comandos serie
+    if (Serial.available()) {
+        String command = Serial.readString();
+        command.trim();
+        command.toUpperCase();
+        
+        Serial.print("Comando serie: ");
+        Serial.println(command);
+        
+        processCommand(command);
+    }
+    
+    delay(10);
+}
+
+/*
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                            DOCUMENTACIÓN API                                ║
+║                          KC868-A16 RELAY CONTROLLER                         ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+🌐 CONFIGURACIÓN DE RED:
+   • IP Fija: 192.168.2.100
+   • Gateway: 192.168.2.1
+   • Máscara: 255.255.255.0
+   • Puerto HTTP: 80
+   • Puerto TCP: 8080
+
+🔧 HARDWARE CONFIGURADO:
+   • ESP32 - KC868-A16 (MASTER)
+   • 16 Relés locales controlados por I2C
+   • Ethernet LAN8720 PHY
+   • RS485 Master: TXD=GPIO13, RXD=GPIO16, DE=GPIO32 (PINOUT OFICIAL KC868-A16)
+   • Direcciones I2C: 0x24 (Relés 1-8), 0x25 (Relés 9-16)
+   • ⏰ AUTO-APAGADO: Relés se apagan automáticamente después de 5 segundos
+
+═══════════════════════════════════════════════════════════════════════════════
+                                 APIs HTTP REST
+═══════════════════════════════════════════════════════════════════════════════
+
+🔗 1. CONTROL UNIFICADO - MASTER + ESCLAVO (POST) ⭐ CORREGIDO ⭐
+   URL: http://192.168.2.100/activate
+   Método: POST
+   Content-Type: application/json
+   
+   📝 Body JSON:
+   {
+     "relay": [1-32],     // 1-16: Master local, 17-32: Esclavo RS485
+     "state": [0-1],      // 0 = OFF, 1 = ON
+     "delay": [0-999999]  // Microsegundos activo (0 = permanente)
+   }
+   
+   🎯 LÓGICA DE CONTROL CORREGIDA:
+   • Relay 1-16:  Controla relés LOCALES del master KC868-A16
+   • Relay 17-32: Controla relés del ESCLAVO RS485 (ID=1)
+     - Relay 17 → Esclavo relé 1
+     - Relay 18 → Esclavo relé 2
+     - ...
+     - Relay 32 → Esclavo relé 16
+   • Delay 0:    Encendido PERMANENTE (sin auto-apagado)
+   • Delay >0:   Auto-apagado después de X microsegundos
+   
+   📋 Ejemplos:
+   • Encender relé 8 del master por 8 segundos:
+     POST http://192.168.2.100/activate
+     {"relay":8,"state":1,"delay":8000}
+   
+   • Encender relé 3 del esclavo permanente:
+     POST http://192.168.2.100/activate
+     {"relay":19,"state":1,"delay":0}
+   
+   • Apagar relé 12 del master:
+     POST http://192.168.2.100/activate
+     {"relay":12,"state":0,"delay":0}
+   
+   ✅ Respuesta exitosa (200) - Master:
+   {
+     "status": "success",
+     "target": "master",
+     "relay": 8,
+     "state": 1,
+     "delay": 8000,
+     "message": "Master Relé 8 ON 8000ms"
+   }
+   
+   ✅ Respuesta exitosa (200) - Esclavo:
+   {
+     "status": "success",
+     "target": "slave",
+     "slave_id": 1,
+     "relay": 19,
+     "slave_relay": 3,
+     "state": 1,
+     "delay": 0,
+     "message": "Esclavo Relé 3 ON"
+   }
+
+───────────────────────────────────────────────────────────────────────────────
+
+🔗 2. CONTROL DE RELÉ LEGACY (POST) - Mantenido para compatibilidad
+   URL: http://192.168.2.100/relay
+   Método: POST
+   Content-Type: application/json
+   
+   📝 Body JSON:
+   {
+     "relay": [1-16],    // Número del relé (1 al 16)
+     "state": [0-1]      // 0 = OFF, 1 = ON (auto-off 5s)
+   }
+   
+   📋 Ejemplo:
+     POST http://192.168.2.100/relay
+     {"relay":5,"state":1}
+
+───────────────────────────────────────────────────────────────────────────────
+
+🔗 3. ESTADO DE TODOS LOS RELÉS (GET)
+   URL: http://192.168.2.100/status
+   Método: GET
+   
+   📋 Ejemplo:
+   GET http://192.168.2.100/status
+   
+   ✅ Respuesta (200):
+   {
+     "relays": [
+       {"relay": 1, "state": 0, "status": "OFF"},
+       {"relay": 2, "state": 1, "status": "ON"},
+       {"relay": 3, "state": 0, "status": "OFF"},
+       ...
+       {"relay": 16, "state": 1, "status": "ON"}
+     ]
+   }
+
+───────────────────────────────────────────────────────────────────────────────
+
+🔗 4. PÁGINA DE AYUDA (GET)
+   URL: http://192.168.2.100/
+   Método: GET
+   
+   📋 Ejemplo:
+   GET http://192.168.2.100/
+   
+   ✅ Respuesta: Página HTML con documentación básica
+
+═══════════════════════════════════════════════════════════════════════════════
+                               CONTROL TCP (RAW)
+═══════════════════════════════════════════════════════════════════════════════
+
+🔌 CONEXIÓN TCP:
+   Host: 192.168.2.100
+   Puerto: 8080
+   
+📝 COMANDOS (terminados con \n):
+   
+   • SET,[relay],[state]
+     - relay: 1-16
+     - state: 0 (OFF) o 1 (ON)
+     
+   • STATUS
+     - Muestra estado de todos los relés
+   
+📋 EJEMPLOS TCP:
+   Conectar: telnet 192.168.2.100 8080
+   
+   Comando: SET,7,1
+   Respuesta: OK: Relé 7 ON
+   
+   Comando: SET,7,0  
+   Respuesta: OK: Relé 7 OFF
+   
+   Comando: STATUS
+   Respuesta: 
+   Estado de relés:
+   Relé 1: OFF
+   Relé 2: ON
+   ...
+   Relé 16: OFF
+
+═══════════════════════════════════════════════════════════════════════════════
+                            CONTROL POR MONITOR SERIE
+═══════════════════════════════════════════════════════════════════════════════
+
+📟 PUERTO SERIE:
+   Baudios: 115200
+   
+📝 COMANDOS:
+   Los mismos comandos TCP funcionan por serie:
+   • SET,5,1    - Encender relé 5
+   • SET,5,0    - Apagar relé 5  
+   • STATUS     - Ver estado de todos
+
+═══════════════════════════════════════════════════════════════════════════════
+                              EJEMPLOS POSTMAN
+═══════════════════════════════════════════════════════════════════════════════
+
+🚀 COLECCIÓN POSTMAN - KC868-A16 CONTROL UNIFICADO CORREGIDO:
+
+┌─ Activar Relé Master (1-16) ───────────────────┐
+│ POST http://192.168.2.100/activate            │
+│ Headers:                                       │
+│   Content-Type: application/json              │
+│ Body (raw):                                    │
+│   {"relay":8,"state":1,"delay":8000}          │
+│ (Encender relé 8 master por 8 segundos)       │
+└────────────────────────────────────────────────┘
+
+┌─ Activar Relé Esclavo (17-32) ─────────────────┐
+│ POST http://192.168.2.100/activate            │
+│ Headers:                                       │
+│   Content-Type: application/json              │
+│ Body (raw):                                    │
+│   {"relay":20,"state":1,"delay":0}            │
+│ (Encender relé 4 esclavo permanente)          │
+└────────────────────────────────────────────────┘
+
+┌─ Activar Último Relé Esclavo ──────────────────┐
+│ POST http://192.168.2.100/activate            │
+│ Headers:                                       │
+│   Content-Type: application/json              │
+│ Body (raw):                                    │
+│   {"relay":32,"state":1,"delay":5000}         │
+│ (Encender relé 16 esclavo por 5 segundos)     │
+└────────────────────────────────────────────────┘
+
+┌─ Desactivar Cualquier Relé ────────────────────┐
+│ POST http://192.168.2.100/activate            │
+│ Headers:                                       │
+│   Content-Type: application/json              │
+│ Body (raw):                                    │
+│   {"relay":25,"state":0,"delay":0}            │
+│ (Apagar relé 9 esclavo)                       │
+└────────────────────────────────────────────────┘
+
+┌─ Estado Todos los Relés ───────────────────────┐
+│ GET http://192.168.2.100/status               │
+│ (Sin headers ni body)                          │
+└────────────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════════
+                                CÓDIGOS DE ERROR
+═══════════════════════════════════════════════════════════════════════════════
+
+HTTP Status Codes:
+• 200 OK - Operación exitosa
+• 400 Bad Request - Parámetros inválidos
+• 404 Not Found - Endpoint no encontrado
+• 500 Internal Server Error - Error del sistema
+
+Errores comunes:
+• "JSON inválido" - Formato JSON incorrecto
+• "Relay 1-16, state 0-1" - Parámetros fuera de rango
+• Sin respuesta - Verificar conectividad de red
+
+═══════════════════════════════════════════════════════════════════════════════
+                              DIAGNÓSTICO DE RED
+═══════════════════════════════════════════════════════════════════════════════
+
+🔍 VERIFICACIONES:
+1. Ping a la IP: ping 192.168.2.100
+2. Verificar puerto HTTP: telnet 192.168.2.100 80  
+3. Verificar puerto TCP: telnet 192.168.2.100 8080
+4. Monitor serie para logs del sistema
+
+🚨 SOLUCIÓN DE PROBLEMAS:
+• Sin conectividad: Verificar cable Ethernet y alimentación 12V
+• IP incorrecta: Verificar configuración de red (Gateway: 192.168.2.1)
+• Relés no responden: Verificar conexiones I2C (SDA=4, SCL=5)
+
+═══════════════════════════════════════════════════════════════════════════════
+                                ESPECIFICACIONES
+═══════════════════════════════════════════════════════════════════════════════
+
+📋 HARDWARE REQUERIDO:
+• KC868-A16 con ESP32
+• Alimentación 12V DC
+• Cable Ethernet CAT5/CAT6
+• Switch/Router con puertos libres
+
+⚡ CARACTERÍSTICAS:
+• 16 relés independientes (5A/250VAC, 5A/30VDC)
+• 🎯 CONTROL UNIFICADO: 1-7 Master, 8-16 Esclavo RS485 via /activate
+• Delay personalizable por relé (0 = permanente, >0 = auto-apagado)
+• Control simultáneo HTTP + TCP + Serie + RS485
+• Master RS485 para controlar múltiples esclavos
+• IP fija configurable
+• CORS habilitado para APIs web
+• Auto-reconexión de red
+• Logs detallados por monitor serie
+• 📡 PROTOCOLO RS485: Comunicación robusta con checksum
+
+🔧 CONFIGURACIÓN I2C:
+• SDA: GPIO 4
+• SCL: GPIO 5  
+• Chip 1 (0x24): Relés 1-8
+• Chip 2 (0x25): Relés 9-16
+• Lógica invertida: LOW=ON, HIGH=OFF
+
+🌐 CONFIGURACIÓN ETHERNET:
+• PHY: LAN8720
+• MDC: GPIO 23
+• MDIO: GPIO 18  
+• Power: GPIO 12
+• Clock: GPIO 17 (Output) ⚡ EXCLUSIVO PARA ETHERNET
+
+📡 CONFIGURACIÓN RS485 MASTER (PINOUT OFICIAL KC868-A16):
+• TXD: GPIO 13 (Oficial según documentación)
+• RXD: GPIO 16 (Oficial según documentación)
+• DE (Data Enable): GPIO 32 (Pin libre)
+• Velocidad: 9600 baud
+• Protocolo: [START][SLAVE_ID][CMD][DATA][CHECKSUM][END]
+• Soporte para 247 esclavos simultáneos
+
+🔌 CONEXIÓN RS485:
+• A+ (Data+) - Conectar a todos los esclavos
+• B- (Data-) - Conectar a todos los esclavos  
+• GND común entre master y esclavos
+• Terminaciones de línea: 120Ω en extremos del bus
+• Distancia máxima: 1200m
+• Velocidad máxima: 10 Mbps (configurado: 9600 baud)
+
+🎯 RESOLUCIÓN DE CONFLICTOS:
+• GPIO17: EXCLUSIVO para Ethernet Clock (ya no usado por RS485)
+• GPIO4: EXCLUSIVO para I2C SDA (ya no usado por RS485)  
+• Pines RS485 oficiales: TXD=GPIO13, RXD=GPIO16, DE=GPIO32
+• PINOUT CONFIRMADO POR DOCUMENTACIÓN OFICIAL KC868-A16
+
+═══════════════════════════════════════════════════════════════════════════════
+Versión: KC868-A16 Unified Controller v4.0 - ¡ENDPOINT UNIFICADO!
+Fecha: Octubre 2025
+Autor: Sistema de Control Industrial
+Características: Master(1-7) + Esclavo RS485(8-16) + Delay personalizable
+═══════════════════════════════════════════════════════════════════════════════
+*/
