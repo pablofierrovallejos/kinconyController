@@ -95,9 +95,24 @@ void turnOffAllRelays() {
 }
 
 void writeToChip(byte address, byte value) {
+    Serial.print("🔧 I2C WRITE → 0x");
+    Serial.print(address, HEX);
+    Serial.print(" = 0x");
+    Serial.print(value, HEX);
+    
     Wire.beginTransmission(address);
     Wire.write(value);
-    Wire.endTransmission();
+    byte result = Wire.endTransmission();
+    
+    Serial.print(" (resultado: ");
+    switch(result) {
+        case 0: Serial.println("✅ OK)"); break;
+        case 1: Serial.println("❌ Datos muy largos)"); break;
+        case 2: Serial.println("❌ NACK en dirección)"); break;
+        case 3: Serial.println("❌ NACK en datos)"); break;
+        case 4: Serial.println("❌ Error desconocido)"); break;
+        default: Serial.print("❌ Error "); Serial.print(result); Serial.println(")"); break;
+    }
 }
 
 void setRelay(int relayNumber, bool state) {
@@ -166,6 +181,13 @@ void setRelayWithDelay(int relayNumber, bool state, unsigned long delayMs) {
     // Leer estado actual del chip
     byte currentState = readFromChip(address);
     
+    Serial.print("🔧 DEBUG I2C - Dirección: 0x");
+    Serial.print(address, HEX);
+    Serial.print(", Pin: ");
+    Serial.print(pin);
+    Serial.print(", Estado actual: 0x");
+    Serial.println(currentState, HEX);
+    
     // Modificar solo el bit correspondiente
     if (state) {
         currentState &= ~(1 << pin);  // Clear bit (LOW = ON)
@@ -191,8 +213,26 @@ void setRelayWithDelay(int relayNumber, bool state, unsigned long delayMs) {
         relayTimers[relayNumber - 1] = 0;
     }
     
+    Serial.print("🔧 DEBUG I2C - Nuevo estado: 0x");
+    Serial.print(currentState, HEX);
+    Serial.print(" (bit ");
+    Serial.print(pin);
+    Serial.print(": ");
+    Serial.print(state ? "LOW=ON" : "HIGH=OFF");
+    Serial.println(")");
+    
     // Escribir nuevo estado
     writeToChip(address, currentState);
+    
+    // Verificar escritura
+    byte verifyState = readFromChip(address);
+    Serial.print("🔧 DEBUG I2C - Estado verificado: 0x");
+    Serial.print(verifyState, HEX);
+    if (verifyState == currentState) {
+        Serial.println(" ✅ Escritura exitosa");
+    } else {
+        Serial.println(" ❌ Error de escritura I2C");
+    }
     
     // Actualizar estado en memoria
     relayStates[relayNumber - 1] = state;
@@ -214,11 +254,20 @@ void setRelayWithDelay(int relayNumber, bool state, unsigned long delayMs) {
 }
 
 byte readFromChip(byte address) {
+    Serial.print("🔧 I2C READ ← 0x");
+    Serial.print(address, HEX);
+    
     Wire.requestFrom(address, (uint8_t)1);
     if (Wire.available()) {
-        return Wire.read();
+        byte value = Wire.read();
+        Serial.print(" = 0x");
+        Serial.print(value, HEX);
+        Serial.println(" ✅");
+        return value;
+    } else {
+        Serial.println(" = 0xFF ❌ Sin respuesta");
+        return 0xFF;  // Default: todos OFF
     }
-    return 0xFF;  // Default: todos OFF
 }
 
 void checkAutoOffTimers() {
@@ -519,6 +568,33 @@ void loop() {
                 Serial.print(": ");
                 Serial.println(relayStates[i] ? "ON" : "OFF");
             }
+        }
+        else if (command == "TEST") {
+            Serial.println("🧪 TEST I2C - Verificando chips...");
+            
+            // Test chip 0x24 (relés 1-8)
+            Serial.println("📋 Chip 0x24 (relés 1-8):");
+            for (int i = 0; i < 8; i++) {
+                Serial.print("  Relé ");
+                Serial.print(i + 1);
+                Serial.print(": ");
+                setRelayWithDelay(i + 1, true, 1000);  // ON por 1 segundo
+                delay(500);
+            }
+            
+            delay(2000);
+            
+            // Test chip 0x25 (relés 9-16)
+            Serial.println("📋 Chip 0x25 (relés 9-16):");
+            for (int i = 8; i < 16; i++) {
+                Serial.print("  Relé ");
+                Serial.print(i + 1);
+                Serial.print(": ");
+                setRelayWithDelay(i + 1, true, 1000);  // ON por 1 segundo
+                delay(500);
+            }
+            
+            Serial.println("🧪 Test completado");
         }
     }
     
