@@ -43,6 +43,7 @@ WiFiClient tcpClient;
 // Variables de estado
 bool relayStates[16] = {false}; // Estado de todos los relés
 unsigned long relayTimers[16] = {0}; // Timers para auto-apagado (5 segundos)
+unsigned long relayActivationTime[16] = {0}; // Timestamp de cuando se activó cada relé
 
 // Variables para detección de pulsos 12V
 volatile bool pulseDetected = false;        // Flag de interrupción
@@ -51,6 +52,9 @@ volatile unsigned long pulseEndTime = 0;    // Tiempo fin del pulso
 volatile bool pulseActive = false;          // Estado actual del pulso
 unsigned long lastPulseProcessed = 0;       // Última vez que se procesó un pulso
 bool pulseProcessingEnabled = true;         // Habilitar/deshabilitar procesamiento
+
+// Constantes de tiempo
+#define RELAY_PROTECTION_TIME 2500          // Tiempo mínimo (2.5s) antes de permitir apagar relé activo
 
 // ═══════════════════════════════════════════════════════════════
 //                   DECLARACIONES FORWARD
@@ -330,27 +334,53 @@ void handlePulseAction(unsigned long duration) {
     
     Serial.println("📋 Pulso de 5ms detectado → Acción configurada:");
     
-    // 🔴 ACCIÓN: APAGAR TODAS LAS SALIDAS
+    // 🔴 ACCIÓN: APAGAR TODAS LAS SALIDAS (con protección de 2.5s)
     Serial.println("   🔴 Apagando relés 1-16 del MASTER...");
     
+    unsigned long now = millis();
     int relaysOff = 0;
+    int relaysProtected = 0;
+    
     for (int i = 1; i <= 16; i++) {
         if (relayStates[i-1]) {  // Si el relé está encendido
-            setRelay(i, false);
-            relaysOff++;
+            // Verificar si ha pasado el tiempo de protección
+            unsigned long timeSinceActivation = now - relayActivationTime[i-1];
+            
+            if (timeSinceActivation >= RELAY_PROTECTION_TIME) {
+                // Relé puede ser apagado (ya pasaron 2.5 segundos)
+                setRelay(i, false);
+                relaysOff++;
+            } else {
+                // Relé está protegido (menos de 2.5 segundos desde activación)
+                unsigned long remaining = RELAY_PROTECTION_TIME - timeSinceActivation;
+                Serial.print("   🛡️  Relé ");
+                Serial.print(i);
+                Serial.print(" PROTEGIDO (faltan ");
+                Serial.print(remaining);
+                Serial.println("ms para poder apagarse)");
+                relaysProtected++;
+            }
         }
     }
     
-    // Limpiar todos los timers de auto-apagado
+    // Limpiar timers solo de los relés apagados
     for (int i = 0; i < 16; i++) {
-        relayTimers[i] = 0;
+        if (!relayStates[i]) {  // Si el relé está apagado
+            relayTimers[i] = 0;
+        }
     }
     
     Serial.print("   ✅ ");
     Serial.print(relaysOff);
     Serial.println(" relés apagados");
     
-    if (relaysOff == 0) {
+    if (relaysProtected > 0) {
+        Serial.print("   🛡️  ");
+        Serial.print(relaysProtected);
+        Serial.println(" relés protegidos (activados hace menos de 2.5s)");
+    }
+    
+    if (relaysOff == 0 && relaysProtected == 0) {
         Serial.println("   ℹ️  Todos los relés ya estaban apagados");
     }
     
@@ -378,6 +408,7 @@ void handlePulseAction(unsigned long duration) {
     notification += "\"timestamp\":" + String(millis()) + ",";
     notification += "\"count\":" + String(pulseCount) + ",";
     notification += "\"relays_turned_off\":" + String(relaysOff) + ",";
+    notification += "\"relays_protected\":" + String(relaysProtected) + ",";
     notification += "\"action\":\"all_relays_off\"}";
     
     if (tcpClient && tcpClient.connected()) {
@@ -385,7 +416,11 @@ void handlePulseAction(unsigned long duration) {
         Serial.println("📡 Notificación TCP enviada");
     }
     
-    Serial.println("✅ Acción completada - Todas las salidas apagadas");
+    if (relaysProtected > 0) {
+        Serial.println("✅ Acción completada - Salidas con protección de 2.5s activa");
+    } else {
+        Serial.println("✅ Acción completada - Todas las salidas apagadas");
+    }
 }
 
 void setup() {
@@ -538,6 +573,8 @@ void setRelay(int relayNumber, bool state) {
         currentState &= ~(1 << pin);  // Clear bit (LOW = ON)
         // ⏰ NUEVA FUNCIONALIDAD: Auto-apagado en 5 segundos
         relayTimers[relayNumber - 1] = millis() + 5000; // 5000ms = 5 segundos
+        // 🛡️ Registrar tiempo de activación para protección
+        relayActivationTime[relayNumber - 1] = millis();
         Serial.print("⏰ Relé ");
         Serial.print(relayNumber);
         Serial.println(" se apagará automáticamente en 5 segundos");
@@ -545,6 +582,8 @@ void setRelay(int relayNumber, bool state) {
         currentState |= (1 << pin);   // Set bit (HIGH = OFF)
         // Cancelar timer si se apaga manualmente
         relayTimers[relayNumber - 1] = 0;
+        // Limpiar tiempo de activación
+        relayActivationTime[relayNumber - 1] = 0;
     }
     
     // Escribir nuevo estado
@@ -1230,15 +1269,22 @@ void setRelayWithDelay(int relayNumber, bool state, int delayMs) {
         currentState &= ~(1 << pin);  // Clear bit (LOW = ON)
         // Configurar timer personalizado
         relayTimers[relayNumber - 1] = millis() + delayMs;
+        // 🛡️ Registrar tiempo de activación para protección
+        relayActivationTime[relayNumber - 1] = millis();
         Serial.print("⏰ Relé ");
         Serial.print(relayNumber);
         Serial.print(" se apagará automáticamente en ");
         Serial.print(delayMs);
         Serial.println(" ms");
+        Serial.print("🛡️ Relé ");
+        Serial.print(relayNumber);
+        Serial.println(" protegido por 2.5 segundos contra pulsos");
     } else {
         currentState |= (1 << pin);   // Set bit (HIGH = OFF)
         // Cancelar timer si se apaga manualmente
         relayTimers[relayNumber - 1] = 0;
+        // Limpiar tiempo de activación
+        relayActivationTime[relayNumber - 1] = 0;
     }
     
     // Escribir nuevo estado
@@ -1284,13 +1330,20 @@ void setRelayPermanent(int relayNumber, bool state) {
         currentState &= ~(1 << pin);  // Clear bit (LOW = ON)
         // NO configurar timer (permanente)
         relayTimers[relayNumber - 1] = 0;
+        // 🛡️ Registrar tiempo de activación para protección
+        relayActivationTime[relayNumber - 1] = millis();
         Serial.print("🔒 Relé ");
         Serial.print(relayNumber);
         Serial.println(" encendido PERMANENTE (sin auto-apagado)");
+        Serial.print("🛡️ Relé ");
+        Serial.print(relayNumber);
+        Serial.println(" protegido por 2.5 segundos contra pulsos");
     } else {
         currentState |= (1 << pin);   // Set bit (HIGH = OFF)
         // Cancelar timer si se apaga manualmente
         relayTimers[relayNumber - 1] = 0;
+        // Limpiar tiempo de activación
+        relayActivationTime[relayNumber - 1] = 0;
     }
     
     // Escribir nuevo estado
