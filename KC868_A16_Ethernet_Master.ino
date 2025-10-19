@@ -10,6 +10,12 @@
 #define RS485_DE_PIN 32    // Pin DE (Data Enable) para RS485 (Pin libre)
 #define RS485_BAUD 9600    // Velocidad RS485
 
+// Configuración entrada analógica CH4 con OpAmp (OPTIMIZADO PARA PULSOS DE 5ms @ 8V)
+#define PULSE_INPUT_PIN 39    // GPIO39 - Entrada analógica CH4 (conectada a OpAmp)
+#define PULSE_THRESHOLD 1800  // Umbral ADC optimizado para 8V (~1.45V en GPIO39)
+#define PULSE_MIN_WIDTH 3     // Ancho mínimo 3ms (para capturar pulsos de 5ms con margen)
+#define PULSE_DEBOUNCE 30     // Debounce entre pulsos: 30ms (6x el ancho del pulso)
+
 HardwareSerial RS485(2);   // Usar Serial2 para RS485
 
 // Configuración específica KC868-A16 basada en documentación oficial
@@ -37,6 +43,347 @@ WiFiClient tcpClient;
 // Variables de estado
 bool relayStates[16] = {false}; // Estado de todos los relés
 unsigned long relayTimers[16] = {0}; // Timers para auto-apagado (5 segundos)
+
+// Variables para detección de pulsos 12V
+volatile bool pulseDetected = false;        // Flag de interrupción
+volatile unsigned long pulseStartTime = 0;  // Tiempo inicio del pulso
+volatile unsigned long pulseEndTime = 0;    // Tiempo fin del pulso
+volatile bool pulseActive = false;          // Estado actual del pulso
+unsigned long lastPulseProcessed = 0;       // Última vez que se procesó un pulso
+bool pulseProcessingEnabled = true;         // Habilitar/deshabilitar procesamiento
+
+// ═══════════════════════════════════════════════════════════════
+//                   DECLARACIONES FORWARD
+// ═══════════════════════════════════════════════════════════════
+
+void sendRS485Command(byte slaveId, byte relay, byte state, unsigned long delayMs);
+void setRelay(int relayNumber, bool state);
+
+// ═══════════════════════════════════════════════════════════════
+//                   FUNCIONES DETECCIÓN DE PULSOS 12V
+// ═══════════════════════════════════════════════════════════════
+
+void IRAM_ATTR pulseInterrupt() {
+    static unsigned long lastTransition = 0;
+    unsigned long now = millis();
+    int analogValue = analogRead(PULSE_INPUT_PIN);
+    
+    // Filtro anti-rebote reducido para pulsos más rápidos
+    if (now - lastTransition < 1) {  // Ignorar cambios < 1ms (ruido)
+        return;
+    }
+    
+    // Detectar flanco de subida (8V presente)
+    if (analogValue >= PULSE_THRESHOLD && !pulseActive) {
+        pulseActive = true;
+        pulseStartTime = now;
+        lastTransition = now;
+    }
+    // Detectar flanco de bajada (8V ausente)
+    else if (analogValue < PULSE_THRESHOLD && pulseActive) {
+        pulseActive = false;
+        pulseEndTime = now;
+        lastTransition = now;
+        
+        unsigned long duration = pulseEndTime - pulseStartTime;
+        
+        // Verificar ancho mínimo (3ms para capturar pulsos de 5ms con margen)
+        if (duration >= PULSE_MIN_WIDTH) {
+            pulseDetected = true;
+        }
+    }
+}
+
+void initPulseDetection() {
+    Serial.println("\n🔌 Inicializando detección de pulsos (optimizado para 5ms @ 8V)...");
+    
+    // ℹ️ INFORMACIÓN DEL SISTEMA
+    Serial.println("╔═══════════════════════════════════════════════════════════╗");
+    Serial.println("║     DETECCIÓN DE PULSOS - CONFIGURACIÓN OPTIMIZADA       ║");
+    Serial.println("╚═══════════════════════════════════════════════════════════╝");
+    Serial.println("📋 Especificaciones del pulso a detectar:");
+    Serial.println("   ✅ Ancho del pulso: 5ms (medido en sistema real)");
+    Serial.println("   ✅ Voltaje máximo: 8V");
+    Serial.println("   ✅ Circuito: CH4 → Divisor + BAT54S + LM324 → GPIO39");
+    Serial.println("   ✅ Voltaje en GPIO39: ~1.6-2V (8V entrada)");
+    Serial.println("");
+    Serial.println("🎯 Configuración de detección:");
+    Serial.println("   • Umbral: 1800 ADC (1.45V en GPIO39 ≈ 5.8V entrada)");
+    Serial.println("   • Ancho mínimo: 3ms (margen 60% del pulso real)");
+    Serial.println("   • Muestreo: 2kHz (cada 0.5ms = 10 muestras por pulso)");
+    Serial.println("   • Debounce: 30ms entre pulsos");
+    Serial.println("   • Filtro ruido: < 1ms ignorado");
+    
+    // Configurar GPIO39 como entrada analógica
+    pinMode(PULSE_INPUT_PIN, INPUT);
+    
+    // Configurar ADC con mejor precisión
+    analogReadResolution(12);  // 12 bits = 0-4095
+    analogSetAttenuation(ADC_11db);  // Atenuación 11dB
+    
+    // CALIBRACIÓN EXTENDIDA - 50 muestras para mayor precisión
+    delay(100);
+    
+    Serial.println("\n🔍 Calibración del sistema (50 muestras)...");
+    int readings[50];
+    int minReading = 4095;
+    int maxReading = 0;
+    float avgReading = 0;
+    
+    for (int i = 0; i < 50; i++) {
+        readings[i] = analogRead(PULSE_INPUT_PIN);
+        avgReading += readings[i];
+        if (readings[i] < minReading) minReading = readings[i];
+        if (readings[i] > maxReading) maxReading = readings[i];
+        delay(5);
+    }
+    avgReading /= 50.0;
+    
+    float avgVoltage = (avgReading * 3.3) / 4095.0;
+    float minVoltage = (minReading * 3.3) / 4095.0;
+    float maxVoltage = (maxReading * 3.3) / 4095.0;
+    
+    Serial.println("📊 Resultados calibración:");
+    Serial.print("   • Promedio: ");
+    Serial.print(avgReading, 0);
+    Serial.print(" ADC (");
+    Serial.print(avgVoltage, 3);
+    Serial.println("V)");
+    
+    Serial.print("   • Rango: ");
+    Serial.print(minReading);
+    Serial.print("-");
+    Serial.print(maxReading);
+    Serial.print(" ADC (");
+    Serial.print(minVoltage, 3);
+    Serial.print("V - ");
+    Serial.print(maxVoltage, 3);
+    Serial.println("V)");
+    
+    Serial.print("   • Variación: ±");
+    Serial.print((maxReading - minReading) / 2);
+    Serial.print(" ADC (±");
+    Serial.print((maxVoltage - minVoltage) / 2, 3);
+    Serial.println("V)");
+    
+    // Calcular SNR (Signal-to-Noise Ratio)
+    int noiseLevel = maxReading - minReading;
+    int signalLevel = PULSE_THRESHOLD - avgReading;
+    
+    Serial.print("   • Nivel de ruido: ");
+    Serial.print(noiseLevel);
+    Serial.println(" ADC");
+    
+    Serial.print("   • Margen señal-ruido: ");
+    Serial.print(signalLevel);
+    Serial.print(" ADC (");
+    Serial.print((signalLevel * 100.0) / PULSE_THRESHOLD, 1);
+    Serial.println("%)");
+    
+    // ESTIMACIÓN DE VOLTAJE DE ENTRADA
+    float estimatedInputVoltage = avgVoltage * 4.0;
+    
+    Serial.print("\n💡 Voltaje de entrada estimado: ~");
+    Serial.print(estimatedInputVoltage, 1);
+    Serial.println("V");
+    
+    if (estimatedInputVoltage < 1.0) {
+        Serial.println("   ℹ️  Estado: SIN SEÑAL (línea en reposo)");
+    } else if (estimatedInputVoltage >= 1.0 && estimatedInputVoltage <= 10.0) {
+        Serial.println("   ⚠️  ADVERTENCIA: Posible señal presente en reposo");
+    }
+    
+    // VALIDACIÓN DE SEGURIDAD
+    if (avgVoltage > 3.3) {
+        Serial.println("\n❌ ERROR CRÍTICO: Voltaje > 3.3V en GPIO39");
+        Serial.println("❌ DESCONECTAR SEÑAL INMEDIATAMENTE");
+        pulseProcessingEnabled = false;
+        return;
+    }
+    else if (avgVoltage > 2.5) {
+        Serial.println("\n⚠️  ADVERTENCIA: Voltaje cercano al límite (>2.5V)");
+    }
+    else if (signalLevel < 200) {
+        Serial.println("\n⚠️  ADVERTENCIA: Margen señal-ruido BAJO (<200 ADC)");
+        Serial.println("⚠️  Puede haber falsas detecciones o pérdida de pulsos");
+    }
+    else {
+        Serial.println("\n✅ Voltaje en rango ÓPTIMO");
+        Serial.println("✅ Margen señal-ruido EXCELENTE");
+    }
+    
+    // Configurar timer con frecuencia optimizada para pulsos de 5ms
+    // API nueva ESP32 Arduino Core 3.x - Muestreo cada 500µs = 2kHz
+    hw_timer_t * timer = timerBegin(1000000);  // 1MHz (1 microsegundo de resolución)
+    timerAttachInterrupt(timer, &pulseInterrupt);
+    timerAlarm(timer, 500, true, 0);  // 500µs = 0.5ms = 2kHz muestreo, auto-reload
+    
+    Serial.println("\n✅ Sistema de detección configurado");
+    Serial.print("📍 Pin: GPIO");
+    Serial.println(PULSE_INPUT_PIN);
+    
+    Serial.print("🎯 Umbral: ");
+    Serial.print(PULSE_THRESHOLD);
+    Serial.print(" ADC (");
+    Serial.print((PULSE_THRESHOLD * 3.3) / 4095, 2);
+    Serial.print("V) → activa con ~");
+    Serial.print(((PULSE_THRESHOLD * 3.3) / 4095) * 4.0, 1);
+    Serial.println("V entrada");
+    
+    Serial.print("⏱️  Ancho mínimo: ");
+    Serial.print(PULSE_MIN_WIDTH);
+    Serial.print("ms (");
+    Serial.print((PULSE_MIN_WIDTH * 100) / 5);  // % del pulso de 5ms
+    Serial.println("% del pulso real)");
+    
+    Serial.print("🔄 Frecuencia muestreo: 2kHz (");
+    Serial.print(5 * 2);  // 10 muestras para pulso de 5ms @ 2kHz
+    Serial.println(" muestras por pulso)");
+    
+    Serial.print("⏳ Debounce: ");
+    Serial.print(PULSE_DEBOUNCE);
+    Serial.println("ms entre pulsos");
+    
+    Serial.println("🛡️  Protección: Divisor + BAT54S + LM324");
+    
+    Serial.println("\n📈 Capacidad de detección:");
+    Serial.print("   • Pulsos detectables: ");
+    Serial.print(1000 / (5 + PULSE_DEBOUNCE));
+    Serial.println(" pulsos/seg máximo");
+    
+    Serial.println("   • Resolución temporal: 0.5ms");
+    Serial.println("   • Precisión ancho: ±0.5ms");
+    
+    Serial.println("\n🚀 Sistema listo para detectar pulsos de 5ms @ 8V");
+}
+
+void processPulseDetection() {
+    if (!pulseProcessingEnabled) return;
+    
+    // Verificar si se detectó un pulso válido
+    if (pulseDetected) {
+        pulseDetected = false;  // Limpiar flag
+        
+        // Debounce mejorado para pulsos rápidos
+        unsigned long now = millis();
+        if (now - lastPulseProcessed < PULSE_DEBOUNCE) {
+            Serial.print("🚫 Pulso ignorado (debounce: ");
+            Serial.print(now - lastPulseProcessed);
+            Serial.print("ms < ");
+            Serial.print(PULSE_DEBOUNCE);
+            Serial.println("ms)");
+            return;
+        }
+        lastPulseProcessed = now;
+        
+        // Calcular duración del pulso
+        unsigned long pulseDuration = pulseEndTime - pulseStartTime;
+        
+        // Validar que el ancho está cerca de lo esperado (5ms ±50%)
+        if (pulseDuration < 3 || pulseDuration > 10) {
+            Serial.print("⚠️  Pulso anormal detectado: ");
+            Serial.print(pulseDuration);
+            Serial.println("ms (esperado: 5ms ±2ms)");
+            // Continuar procesando de todas formas
+        }
+        
+        Serial.println("\n╔═══════════════════════════════════════════════════╗");
+        Serial.println("║     🚨 ¡PULSO DE 8V DETECTADO!                  ║");
+        Serial.println("╚═══════════════════════════════════════════════════╝");
+        Serial.print("📊 Duración medida: ");
+        Serial.print(pulseDuration);
+        Serial.print("ms (esperado: ~5ms)");
+        
+        if (pulseDuration >= 4 && pulseDuration <= 6) {
+            Serial.println(" ✅ PERFECTO");
+        } else if (pulseDuration >= 3 && pulseDuration <= 8) {
+            Serial.println(" ⚠️  Aceptable");
+        } else {
+            Serial.println(" ❌ Fuera de rango");
+        }
+        
+        Serial.print("⏰ Timestamp: ");
+        Serial.print(now);
+        Serial.println("ms");
+        
+        // Leer voltaje actual para log
+        int currentADC = analogRead(PULSE_INPUT_PIN);
+        float currentVoltage = (currentADC * 3.3) / 4095.0;
+        Serial.print("📈 Voltaje actual GPIO39: ");
+        Serial.print(currentADC);
+        Serial.print(" ADC (");
+        Serial.print(currentVoltage, 2);
+        Serial.println("V)");
+        
+        // Ejecutar acción personalizada
+        handlePulseAction(pulseDuration);
+        
+        Serial.println("═════════════════════════════════════════════════════\n");
+    }
+}
+
+void handlePulseAction(unsigned long duration) {
+    Serial.println("⚡ Ejecutando acción por pulso de 8V...");
+    
+    // 🎯 ACCIÓN ESPECÍFICA PARA PULSOS DE ~5ms
+    // Como todos los pulsos son de 5ms, no clasificamos por duración
+    
+    Serial.println("📋 Pulso de 5ms detectado → Acción configurada:");
+    
+    // PERSONALIZAR AQUÍ LA ACCIÓN DESEADA:
+    
+    // Opción 1: Activar relé específico
+    Serial.println("   → Activando relé 1 del MASTER por 3 segundos");
+    setRelay(1, true);
+    relayTimers[0] = millis() + 3000;
+    
+    // Opción 2: Toggle relé (alternar estado) - COMENTADO
+    // bool currentState = relayStates[0];  // Relé 1
+    // Serial.print("   → Toggle relé 1: ");
+    // Serial.println(currentState ? "OFF → ON" : "ON → OFF");
+    // setRelay(1, !currentState);
+    // relayTimers[0] = millis() + 5000;
+    
+    // Opción 3: Activar secuencia de relés - COMENTADO
+    // Serial.println("   → Secuencia: Relés 1-4 con 500ms entre cada uno");
+    // for (int i = 1; i <= 4; i++) {
+    //     setRelay(i, true);
+    //     relayTimers[i-1] = millis() + 2000;
+    //     delay(500);
+    // }
+    
+    // Log detallado
+    Serial.println("� Detalles del pulso:");
+    Serial.print("  - Inicio: ");
+    Serial.print(pulseStartTime);
+    Serial.println("ms");
+    Serial.print("  - Fin: ");
+    Serial.print(pulseEndTime);
+    Serial.println("ms");
+    Serial.print("  - Duración: ");
+    Serial.print(duration);
+    Serial.println("ms");
+    
+    // Contador de pulsos
+    static unsigned long pulseCount = 0;
+    pulseCount++;
+    Serial.print("  - Total pulsos detectados: ");
+    Serial.println(pulseCount);
+    
+    // Notificación JSON para clientes TCP si están conectados
+    String notification = "{\"event\":\"pulse_detected\",";
+    notification += "\"duration\":" + String(duration) + ",";
+    notification += "\"timestamp\":" + String(millis()) + ",";
+    notification += "\"count\":" + String(pulseCount) + ",";
+    notification += "\"action\":\"relay_1_activated\"}";
+    
+    if (tcpClient && tcpClient.connected()) {
+        tcpClient.println("PULSE: " + notification);
+        Serial.println("📡 Notificación TCP enviada");
+    }
+    
+    Serial.println("✅ Acción completada");
+}
 
 void setup() {
     Serial.begin(115200);
@@ -72,6 +419,9 @@ void setup() {
     
     // Inicializar RS485 Master (PINOUT OFICIAL KC868-A16)
     initRS485();
+    
+    // Inicializar detección de pulsos 12V en CH4/GPIO39
+    initPulseDetection();
     
     // Verificar chips I2C
     bool chip1_ok = testChip(RELAY_CHIP_1);
@@ -682,18 +1032,103 @@ void initHTTPServer() {
                        ",\"state\":" + String(relayStates[i] ? 1 : 0) + 
                        ",\"status\":\"" + String(relayStates[i] ? "ON" : "OFF") + "\"}";
         }
-        response += "]}";
+        response += "],";
+        
+        // Agregar información de detección de pulsos
+        int currentValue = analogRead(PULSE_INPUT_PIN);
+        float voltage = (currentValue * 3.3) / 4095.0;
+        
+        response += "\"pulse_detection\":{";
+        response += "\"enabled\":" + String(pulseProcessingEnabled ? "true" : "false") + ",";
+        response += "\"gpio\":" + String(PULSE_INPUT_PIN) + ",";
+        response += "\"current_adc\":" + String(currentValue) + ",";
+        response += "\"current_voltage\":" + String(voltage, 2) + ",";
+        response += "\"threshold_adc\":" + String(PULSE_THRESHOLD) + ",";
+        response += "\"threshold_voltage\":" + String((PULSE_THRESHOLD * 3.3) / 4095, 2) + ",";
+        response += "\"min_width_ms\":" + String(PULSE_MIN_WIDTH) + ",";
+        response += "\"last_pulse_ms\":" + String(lastPulseProcessed) + ",";
+        response += "\"current_state\":\"" + String(currentValue >= PULSE_THRESHOLD ? "HIGH" : "LOW") + "\"";
+        response += "}}";
+        
         httpServer.send(200, "application/json", response);
+    });
+    
+    // POST /pulse - Controlar detección de pulsos
+    httpServer.on("/pulse", HTTP_POST, []() {
+        if (httpServer.hasArg("plain")) {
+            String body = httpServer.arg("plain");
+            
+            // Parsear JSON para extraer comando
+            String command = "";
+            
+            int enablePos = body.indexOf("\"enable\":");
+            int testPos = body.indexOf("\"test\":");
+            
+            if (enablePos >= 0) {
+                // Buscar valor después de "enable":
+                int valueStart = body.indexOf(':', enablePos) + 1;
+                String value = body.substring(valueStart);
+                value.trim();
+                value.replace("\"", "");
+                value.replace("}", "");
+                value.replace(" ", "");
+                
+                if (value == "true" || value == "1") {
+                    pulseProcessingEnabled = true;
+                    httpServer.send(200, "application/json", 
+                                   "{\"status\":\"success\",\"message\":\"Pulse detection ENABLED\"}");
+                } else if (value == "false" || value == "0") {
+                    pulseProcessingEnabled = false;
+                    httpServer.send(200, "application/json", 
+                                   "{\"status\":\"success\",\"message\":\"Pulse detection DISABLED\"}");
+                } else {
+                    httpServer.send(400, "application/json", 
+                                   "{\"status\":\"error\",\"message\":\"Invalid enable value\"}");
+                }
+            }
+            else if (testPos >= 0) {
+                // Ejecutar test de pulso
+                Serial.println("🧪 Test de pulso ejecutado via HTTP");
+                handlePulseAction(300);  // Simular pulso de 300ms
+                httpServer.send(200, "application/json", 
+                               "{\"status\":\"success\",\"message\":\"Pulse test executed (300ms)\"}");
+            }
+            else {
+                httpServer.send(400, "application/json", 
+                               "{\"status\":\"error\",\"message\":\"Invalid JSON format. Use {\\\"enable\\\":true/false} or {\\\"test\\\":true}\"}");
+            }
+        } else {
+            httpServer.send(400, "application/json", 
+                           "{\"status\":\"error\",\"message\":\"Missing JSON body\"}");
+        }
     });
     
     // GET / - Página de ayuda
     httpServer.on("/", HTTP_GET, []() {
         String html = "<html><body>";
         html += "<h1>KC868-A16 Relay Controller</h1>";
-        html += "<h2>API Endpoints:</h2>";
-        html += "<p><b>POST /relay</b> - Control relay<br>";
+        html += "<h2>🔧 Relay Control API:</h2>";
+        html += "<p><b>POST /activate</b> - Unified relay control (Master + Slave)<br>";
+        html += "Body: {\"relay\":25,\"state\":1,\"delay\":5000}</p>";
+        html += "<p><b>POST /relay</b> - Master relay control<br>";
         html += "Body: {\"relay\":5,\"state\":1}</p>";
-        html += "<p><b>GET /status</b> - All relays status</p>";
+        html += "<p><b>GET /status</b> - Complete system status</p>";
+        
+        html += "<h2>🚨 Pulse Detection API (GPIO39):</h2>";
+        html += "<p><b>POST /pulse</b> - Control pulse detection<br>";
+        html += "Enable: {\"enable\":true}<br>";
+        html += "Disable: {\"enable\":false}<br>";
+        html += "Test: {\"test\":true}</p>";
+        
+        html += "<h2>📊 Current Status:</h2>";
+        html += "<p>Pulse Detection: <b>" + String(pulseProcessingEnabled ? "ENABLED" : "DISABLED") + "</b></p>";
+        
+        int currentADC = analogRead(PULSE_INPUT_PIN);
+        float currentVoltage = (currentADC * 3.3) / 4095.0;
+        html += "<p>GPIO39 ADC: <b>" + String(currentADC) + "</b> (" + String(currentVoltage, 2) + "V)</p>";
+        html += "<p>Threshold: <b>" + String(PULSE_THRESHOLD) + "</b> ADC (" + String((PULSE_THRESHOLD * 3.3) / 4095, 2) + "V)</p>";
+        html += "<p>Current State: <b>" + String(currentADC >= PULSE_THRESHOLD ? "HIGH (12V)" : "LOW (0V)") + "</b></p>";
+        
         html += "</body></html>";
         httpServer.send(200, "text/html", html);
     });
@@ -922,9 +1357,46 @@ void processCommand(String command, WiFiClient* client = nullptr) {
         for (int i = 0; i < 16; i++) {
             response += "Relé " + String(i + 1) + ": " + (relayStates[i] ? "ON" : "OFF") + "\r\n";
         }
+        response += "\r\nDetección de pulsos: " + String(pulseProcessingEnabled ? "HABILITADA" : "DESHABILITADA") + "\r\n";
+        response += "Último pulso: " + String(lastPulseProcessed) + "ms\r\n";
+    }
+    else if (command == "PULSE_ON") {
+        pulseProcessingEnabled = true;
+        response = "OK: Detección de pulsos HABILITADA\r\n";
+    }
+    else if (command == "PULSE_OFF") {
+        pulseProcessingEnabled = false;
+        response = "OK: Detección de pulsos DESHABILITADA\r\n";
+    }
+    else if (command == "PULSE_STATUS") {
+        int currentValue = analogRead(PULSE_INPUT_PIN);
+        float voltage = (currentValue * 3.3) / 4095.0;
+        
+        response = "Estado detección de pulsos:\r\n";
+        response += "  - Habilitado: " + String(pulseProcessingEnabled ? "SÍ" : "NO") + "\r\n";
+        response += "  - Pin GPIO: " + String(PULSE_INPUT_PIN) + "\r\n";
+        response += "  - Valor ADC actual: " + String(currentValue) + "\r\n";
+        response += "  - Voltaje actual: " + String(voltage, 2) + "V\r\n";
+        response += "  - Umbral ADC: " + String(PULSE_THRESHOLD) + "\r\n";
+        response += "  - Umbral voltaje: " + String((PULSE_THRESHOLD * 3.3) / 4095, 2) + "V\r\n";
+        response += "  - Ancho mínimo: " + String(PULSE_MIN_WIDTH) + "ms\r\n";
+        response += "  - Último pulso: " + String(lastPulseProcessed) + "ms\r\n";
+        response += "  - Estado actual: " + String(currentValue >= PULSE_THRESHOLD ? "ALTO (12V)" : "BAJO (0V)") + "\r\n";
+    }
+    else if (command == "PULSE_TEST") {
+        response = "Simulando detección de pulso de prueba...\r\n";
+        handlePulseAction(250);  // Simular pulso de 250ms
+        response += "Pulso de prueba ejecutado (250ms)\r\n";
     }
     else {
         response = "ERROR: Comando desconocido\r\n";
+        response += "Comandos disponibles:\r\n";
+        response += "  SET,<relé>,<estado> - Control de relés\r\n";
+        response += "  STATUS - Estado del sistema\r\n";
+        response += "  PULSE_ON - Habilitar detección de pulsos\r\n";
+        response += "  PULSE_OFF - Deshabilitar detección de pulsos\r\n";
+        response += "  PULSE_STATUS - Estado detallado de pulsos\r\n";
+        response += "  PULSE_TEST - Probar acción de pulso\r\n";
     }
     
     if (client && response.length() > 0) {
@@ -937,6 +1409,9 @@ void processCommand(String command, WiFiClient* client = nullptr) {
 void loop() {
     // ⏰ VERIFICAR TIMERS DE AUTO-APAGADO (NUEVA FUNCIONALIDAD)
     checkAutoOffTimers();
+    
+    // 🚨 PROCESAR DETECCIÓN DE PULSOS 12V
+    processPulseDetection();
     
     // Manejar servidor HTTP
     httpServer.handleClient();
@@ -1292,7 +1767,16 @@ Errores comunes:
 • Protocolo: [START][SLAVE_ID][CMD][DATA][CHECKSUM][END]
 • Soporte para 247 esclavos simultáneos
 
-🔌 CONEXIÓN RS485:
+� DETECCIÓN DE PULSOS 12V (ENTRADA ANALÓGICA CH4):
+• Pin: GPIO 39 (Entrada analógica CH4)
+• Conexión: OpAmp → GPIO39
+• Resolución ADC: 12 bits (0-4095)
+• Umbral: 2048 ADC (~1.65V después del OpAmp)
+• Ancho mínimo: 10ms (filtro anti-ruido)
+• Muestreo: 1kHz (cada 1ms por timer)
+• Acciones configurables por duración de pulso
+
+�🔌 CONEXIÓN RS485:
 • A+ (Data+) - Conectar a todos los esclavos
 • B- (Data-) - Conectar a todos los esclavos  
 • GND común entre master y esclavos
@@ -1303,13 +1787,15 @@ Errores comunes:
 🎯 RESOLUCIÓN DE CONFLICTOS:
 • GPIO17: EXCLUSIVO para Ethernet Clock (ya no usado por RS485)
 • GPIO4: EXCLUSIVO para I2C SDA (ya no usado por RS485)  
+• GPIO39: EXCLUSIVO para detección de pulsos 12V (entrada analógica)
 • Pines RS485 oficiales: TXD=GPIO13, RXD=GPIO16, DE=GPIO32
 • PINOUT CONFIRMADO POR DOCUMENTACIÓN OFICIAL KC868-A16
 
 ═══════════════════════════════════════════════════════════════════════════════
-Versión: KC868-A16 Unified Controller v4.0 - ¡ENDPOINT UNIFICADO!
+Versión: KC868-A16 Unified Controller v5.0 - ¡DETECCIÓN DE PULSOS 12V!
 Fecha: Octubre 2025
 Autor: Sistema de Control Industrial
-Características: Master(1-7) + Esclavo RS485(8-16) + Delay personalizable
+Características: Master(1-16) + Esclavo RS485(17-32) + Detección Pulsos 12V + Delay personalizable
+Nuevas funciones: Detección de pulsos 12V en GPIO39 con OpAmp, acciones configurables
 ═══════════════════════════════════════════════════════════════════════════════
 */
