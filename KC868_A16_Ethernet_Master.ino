@@ -330,27 +330,29 @@ void handlePulseAction(unsigned long duration) {
     
     Serial.println("📋 Pulso de 5ms detectado → Acción configurada:");
     
-    // PERSONALIZAR AQUÍ LA ACCIÓN DESEADA:
+    // 🔴 ACCIÓN: APAGAR TODAS LAS SALIDAS
+    Serial.println("   🔴 Apagando relés 1-16 del MASTER...");
     
-    // Opción 1: Activar relé específico
-    Serial.println("   → Activando relé 1 del MASTER por 3 segundos");
-    setRelay(1, true);
-    relayTimers[0] = millis() + 3000;
+    int relaysOff = 0;
+    for (int i = 1; i <= 16; i++) {
+        if (relayStates[i-1]) {  // Si el relé está encendido
+            setRelay(i, false);
+            relaysOff++;
+        }
+    }
     
-    // Opción 2: Toggle relé (alternar estado) - COMENTADO
-    // bool currentState = relayStates[0];  // Relé 1
-    // Serial.print("   → Toggle relé 1: ");
-    // Serial.println(currentState ? "OFF → ON" : "ON → OFF");
-    // setRelay(1, !currentState);
-    // relayTimers[0] = millis() + 5000;
+    // Limpiar todos los timers de auto-apagado
+    for (int i = 0; i < 16; i++) {
+        relayTimers[i] = 0;
+    }
     
-    // Opción 3: Activar secuencia de relés - COMENTADO
-    // Serial.println("   → Secuencia: Relés 1-4 con 500ms entre cada uno");
-    // for (int i = 1; i <= 4; i++) {
-    //     setRelay(i, true);
-    //     relayTimers[i-1] = millis() + 2000;
-    //     delay(500);
-    // }
+    Serial.print("   ✅ ");
+    Serial.print(relaysOff);
+    Serial.println(" relés apagados");
+    
+    if (relaysOff == 0) {
+        Serial.println("   ℹ️  Todos los relés ya estaban apagados");
+    }
     
     // Log detallado
     Serial.println("� Detalles del pulso:");
@@ -375,14 +377,15 @@ void handlePulseAction(unsigned long duration) {
     notification += "\"duration\":" + String(duration) + ",";
     notification += "\"timestamp\":" + String(millis()) + ",";
     notification += "\"count\":" + String(pulseCount) + ",";
-    notification += "\"action\":\"relay_1_activated\"}";
+    notification += "\"relays_turned_off\":" + String(relaysOff) + ",";
+    notification += "\"action\":\"all_relays_off\"}";
     
     if (tcpClient && tcpClient.connected()) {
         tcpClient.println("PULSE: " + notification);
         Serial.println("📡 Notificación TCP enviada");
     }
     
-    Serial.println("✅ Acción completada");
+    Serial.println("✅ Acción completada - Todas las salidas apagadas");
 }
 
 void setup() {
