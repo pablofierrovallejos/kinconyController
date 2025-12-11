@@ -4,6 +4,19 @@
 #include <WebServer.h>
 #include <HardwareSerial.h>
 
+// ═══════════════════════════════════════════════════════════════
+//          🌐 CONFIGURACIÓN DE CONEXIÓN: WiFi o Ethernet
+// ═══════════════════════════════════════════════════════════════
+// Cambiar este flag para seleccionar el tipo de conexión:
+//   true  = Usar WiFi como conexión principal
+//   false = Usar Ethernet como conexión principal
+#define USE_WIFI true
+
+// Credenciales WiFi (solo se usan si USE_WIFI = true)
+const char* WIFI_SSID = "MERCUSYS_57B0";
+const char* WIFI_PASSWORD = "96552333Aa";
+// ═══════════════════════════════════════════════════════════════
+
 // Configuración RS485 (PINOUT OFICIAL KC868-A16)
 #define RS485_TX_PIN 13    // Pin TX para RS485 (OFICIAL: TXD=13)
 #define RS485_RX_PIN 16    // Pin RX para RS485 (OFICIAL: RXD=16)  
@@ -440,15 +453,28 @@ void setup() {
     Serial.print(ESP.getFreeHeap() / 1024);
     Serial.println(" KB");
     
-    // PRIORIDAD MÁXIMA A ETHERNET
-    Serial.println("\n🚀 INICIALIZANDO ETHERNET CON PRIORIDAD MÁXIMA");
-    
-    // Liberar WiFi completamente para Ethernet
-    WiFi.mode(WIFI_OFF);
-    delay(1000);
-    
-    // Inicializar Ethernet PRIMERO
-    initEthernet();
+    // Inicializar conexión según configuración
+    if (USE_WIFI) {
+        Serial.println("\n📶 MODO WIFI SELECCIONADO");
+        Serial.println("🚀 Inicializando WiFi como conexión principal...");
+        
+        // Apagar Ethernet para WiFi
+        ETH.end();
+        delay(500);
+        
+        // Inicializar WiFi
+        initWiFi();
+    } else {
+        Serial.println("\n⚡ MODO ETHERNET SELECCIONADO");
+        Serial.println("🚀 Inicializando Ethernet con prioridad máxima...");
+        
+        // Liberar WiFi completamente para Ethernet
+        WiFi.mode(WIFI_OFF);
+        delay(1000);
+        
+        // Inicializar Ethernet PRIMERO
+        initEthernet();
+    }
     
     // Después inicializar I2C para relés
     Serial.println("\n🔧 Inicializando control de relés...");
@@ -481,16 +507,27 @@ void setup() {
     String connectionType = "";
     IPAddress currentIP;
     
-    if (ETH.linkUp()) {
-        hasConnectivity = true;
-        connectionType = "Ethernet";
-        currentIP = ETH.localIP();
-        Serial.println("\n🎯 ¡ETHERNET COMO CONEXIÓN PRINCIPAL!");
-    } else if (WiFi.status() == WL_CONNECTED) {
-        hasConnectivity = true;
-        connectionType = "WiFi";
-        currentIP = WiFi.localIP();
-        Serial.println("\n📶 WiFi como respaldo");
+    if (USE_WIFI) {
+        // Modo WiFi
+        if (WiFi.status() == WL_CONNECTED) {
+            hasConnectivity = true;
+            connectionType = "WiFi";
+            currentIP = WiFi.localIP();
+            Serial.println("\n🎯 ¡WIFI CONECTADO EXITOSAMENTE!");
+        }
+    } else {
+        // Modo Ethernet
+        if (ETH.linkUp()) {
+            hasConnectivity = true;
+            connectionType = "Ethernet";
+            currentIP = ETH.localIP();
+            Serial.println("\n🎯 ¡ETHERNET COMO CONEXIÓN PRINCIPAL!");
+        } else if (WiFi.status() == WL_CONNECTED) {
+            hasConnectivity = true;
+            connectionType = "WiFi (Respaldo)";
+            currentIP = WiFi.localIP();
+            Serial.println("\n📶 WiFi activado como respaldo");
+        }
     }
     
     if (hasConnectivity) {
@@ -887,7 +924,7 @@ void initEthernet() {
         Serial.println("❌ Falló");
     }
     
-    // Si todo falla, diagnóstico y WiFi
+    // Si todo falla, diagnóstico
     Serial.println("\n❌ ETHERNET NO DISPONIBLE");
     Serial.println("🔍 Verificaciones necesarias:");
     Serial.println("  1. ¿Cable Ethernet conectado y funcionando?");
@@ -895,24 +932,29 @@ void initEthernet() {
     Serial.println("  3. ¿Switch/router con luces de actividad?");
     Serial.println("  4. ¿LEDs del puerto Ethernet encendidos?");
     
-    Serial.println("\n🔄 Activando WiFi como respaldo...");
-    delay(2000);
-    initWiFi();
+    // Solo activar WiFi como respaldo si el flag está en false (modo Ethernet)
+    if (!USE_WIFI) {
+        Serial.println("\n🔄 Activando WiFi como respaldo...");
+        delay(2000);
+        initWiFi();
+    } else {
+        Serial.println("\n⚠️  Sin conexión de red disponible");
+    }
 }
 
 void initWiFi() {
-    Serial.println("\n=== WIFI COMO RESPALDO ===");
+    if (USE_WIFI) {
+        Serial.println("\n=== WIFI COMO CONEXIÓN PRINCIPAL ===");
+    } else {
+        Serial.println("\n=== WIFI COMO RESPALDO ===");
+    }
     
     WiFi.mode(WIFI_STA);
     
-    // Credenciales WiFi - CAMBIAR ESTAS
-    const char* ssid = "MERCUSYS_57B0";
-    const char* password = "96552333Aa";
-    
     Serial.print("Conectando a WiFi: ");
-    Serial.println(ssid);
+    Serial.println(WIFI_SSID);
     
-    WiFi.begin(ssid, password);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     
     int attempts = 0;
     while (WiFi.status() != WL_CONNECTED && attempts < 20) {
